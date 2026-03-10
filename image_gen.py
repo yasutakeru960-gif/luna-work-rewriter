@@ -13,10 +13,35 @@ import config
 
 _client = None
 
-# Japanese fonts (macOS)
-_FONT_BOLD = "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc"
-_FONT_MEDIUM = "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc"
-_FONT_REGULAR = "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"
+# Japanese fonts - try macOS first, then Linux (Noto Sans CJK)
+_FONT_CANDIDATES_BOLD = [
+    "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+]
+_FONT_CANDIDATES_MEDIUM = [
+    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Medium.ttc",
+]
+_FONT_CANDIDATES_REGULAR = [
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+]
+
+
+def _find_font(candidates: list[str]) -> str | None:
+    import os
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_FONT_BOLD = _find_font(_FONT_CANDIDATES_BOLD)
+_FONT_MEDIUM = _find_font(_FONT_CANDIDATES_MEDIUM)
+_FONT_REGULAR = _find_font(_FONT_CANDIDATES_REGULAR)
 
 
 def _get_client():
@@ -142,13 +167,14 @@ def _draw_title_text_styled(draw: ImageDraw.Draw, title: str, w: int, h: int):
     else:
         font_size = 38
 
-    try:
-        font = ImageFont.truetype(_FONT_BOLD, font_size)
-    except Exception:
-        try:
-            font = ImageFont.truetype(_FONT_MEDIUM, font_size)
-        except Exception:
-            font = ImageFont.load_default()
+    font = ImageFont.load_default()
+    for candidate in [_FONT_BOLD, _FONT_MEDIUM, _FONT_REGULAR]:
+        if candidate:
+            try:
+                font = ImageFont.truetype(candidate, font_size)
+                break
+            except Exception:
+                continue
 
     # Calculate text block dimensions
     line_spacing = int(font_size * 0.6)
@@ -196,10 +222,14 @@ def _draw_title_text_styled(draw: ImageDraw.Draw, title: str, w: int, h: int):
         draw.text((x, y), line, fill=(60, 30, 50, 255), font=font)
 
     # Draw "LUNA WORK" branding at bottom center
-    try:
-        brand_font = ImageFont.truetype(_FONT_MEDIUM, 18)
-    except Exception:
-        brand_font = ImageFont.load_default()
+    brand_font = ImageFont.load_default()
+    for candidate in [_FONT_MEDIUM, _FONT_REGULAR]:
+        if candidate:
+            try:
+                brand_font = ImageFont.truetype(candidate, 18)
+                break
+            except Exception:
+                continue
 
     brand_text = "LUNA WORK"
     brand_bbox = draw.textbbox((0, 0), brand_text, font=brand_font)

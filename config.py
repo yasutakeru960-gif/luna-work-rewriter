@@ -2,21 +2,33 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from the same directory as this file
+# Load .env from the same directory as this file (local development)
 _env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(_env_path, override=True)
 
+
+def _get_secret(key: str) -> str | None:
+    """Get secret from Streamlit Cloud secrets or environment variable."""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key)
+
+
 # API Keys
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-GOOGLE_AI_API_KEY = os.getenv("GOOGLE_AI_API_KEY")
+ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
+GOOGLE_AI_API_KEY = _get_secret("GOOGLE_AI_API_KEY")
 
 # WordPress
 WP_URL = "https://mixpost.net"
 WP_REST_BASE = f"{WP_URL}/wp-json/wp/v2"
 WP_POSTS_ENDPOINT = f"{WP_REST_BASE}/posts"
 WP_MEDIA_ENDPOINT = f"{WP_REST_BASE}/media"
-WP_USERNAME = os.getenv("WP_USERNAME")
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
+WP_USERNAME = _get_secret("WP_USERNAME")
+WP_APP_PASSWORD = _get_secret("WP_APP_PASSWORD")
 
 # Claude Model
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
