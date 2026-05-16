@@ -215,8 +215,9 @@ def _call_generate(
     size: str,
     quality: str,
     max_retries: int = 3,
-) -> bytes | None:
-    """images.generate — no reference image."""
+) -> bytes:
+    """images.generate — no reference image. Raises on permanent failure."""
+    last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
             result = _get_client().images.generate(
@@ -226,12 +227,18 @@ def _call_generate(
                 quality=quality,
                 n=1,
             )
-            return _decode_first(result)
-        except Exception:
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(3 * (attempt + 1))
-    return None
+            png_bytes = _decode_first(result)
+            if png_bytes is None:
+                raise RuntimeError("OpenAI returned no image data in response")
+            return png_bytes
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+    raise RuntimeError(
+        f"gpt-image-2 generate failed after {max_retries} attempts. "
+        f"Last error: {type(last_error).__name__}: {last_error}"
+    )
 
 
 def _call_edit(
@@ -240,8 +247,9 @@ def _call_edit(
     size: str,
     quality: str,
     max_retries: int = 3,
-) -> bytes | None:
-    """images.edit — with reference image for character consistency."""
+) -> bytes:
+    """images.edit — with reference image. Raises on permanent failure."""
+    last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
             with open(reference_path, "rb") as fh:
@@ -254,19 +262,25 @@ def _call_edit(
                     input_fidelity="high",
                     n=1,
                 )
-            return _decode_first(result)
-        except Exception:
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(3 * (attempt + 1))
-    return None
+            png_bytes = _decode_first(result)
+            if png_bytes is None:
+                raise RuntimeError("OpenAI returned no image data in response")
+            return png_bytes
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+    raise RuntimeError(
+        f"gpt-image-2 edit failed after {max_retries} attempts. "
+        f"Last error: {type(last_error).__name__}: {last_error}"
+    )
 
 
 def _decode_first(result) -> bytes | None:
     """gpt-image-2 always returns b64_json."""
-    if not result or not result.data:
+    if not result or not getattr(result, "data", None):
         return None
-    b64 = result.data[0].b64_json
+    b64 = getattr(result.data[0], "b64_json", None)
     if not b64:
         return None
     return base64.b64decode(b64)
