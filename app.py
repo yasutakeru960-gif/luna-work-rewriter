@@ -1,8 +1,11 @@
+import dataclasses
+import json
+
 import streamlit as st
 
 import config
-from scraper import scrape_article, create_article_from_text
-from rewriter import rewrite_article
+from scraper import scrape_article, create_article_from_text, ScrapedArticle
+from rewriter import rewrite_article, RewrittenArticle
 from image_gen import generate_article_images, regenerate_character_reference
 from wordpress import (
     test_connection,
@@ -10,6 +13,18 @@ from wordpress import (
     create_post,
     insert_images_into_html,
 )
+
+
+def _serialize_draft() -> str:
+    """Serialize the scraped + rewritten article to JSON for download."""
+    return json.dumps(
+        {
+            "scraped": dataclasses.asdict(st.session_state.scraped),
+            "rewritten": dataclasses.asdict(st.session_state.rewritten),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 st.set_page_config(
     page_title="LUNA WORK Article Rewriter",
@@ -71,8 +86,8 @@ for key in ["scraped", "rewritten", "images", "wp_post"]:
 # ========================================
 st.header("Step 1: 踏襲する記事を入力")
 
-input_tab_url, input_tab_text, input_tab_file = st.tabs(
-    ["URLから取得", "テキスト貼り付け", "ファイルアップロード"]
+input_tab_url, input_tab_text, input_tab_file, input_tab_draft = st.tabs(
+    ["URLから取得", "テキスト貼り付け", "ファイルアップロード", "下書きを読み込む"]
 )
 
 with input_tab_url:
@@ -130,6 +145,32 @@ with input_tab_file:
         st.session_state.wp_post = None
         st.success("ファイルを読み込みました")
 
+with input_tab_draft:
+    st.caption(
+        "リライト後にダウンロードしたJSONを読み込めば、リライトをやり直さずに画像生成からやり直せます。"
+    )
+    uploaded_draft = st.file_uploader(
+        "下書きJSON",
+        type=["json"],
+        key="draft_upload",
+    )
+    if st.button(
+        "この下書きから再開",
+        disabled=uploaded_draft is None,
+        type="primary",
+        key="btn_draft",
+    ):
+        try:
+            data = json.loads(uploaded_draft.read().decode("utf-8"))
+            st.session_state.scraped = ScrapedArticle(**data["scraped"])
+            st.session_state.rewritten = RewrittenArticle(**data["rewritten"])
+            st.session_state.images = None
+            st.session_state.wp_post = None
+            st.success("下書きを復元しました。Step 4以降から再開できます")
+            st.rerun()
+        except Exception as e:
+            st.error(f"下書きの読み込み失敗: {e}")
+
 # ========================================
 # Step 2: Show Scraped Content
 # ========================================
@@ -180,6 +221,14 @@ if st.session_state.rewritten:
     st.subheader(rewritten.title)
     st.caption(f"Slug: {rewritten.slug}")
     st.caption(f"Meta: {rewritten.meta_description}")
+
+    st.download_button(
+        "下書きをダウンロード(JSON)",
+        data=_serialize_draft(),
+        file_name=f"draft_{rewritten.slug or 'article'}.json",
+        mime="application/json",
+        help="リロードや再デプロイで作業が消えないよう、リライト結果をJSONで保存できます。Step 1 の「下書きを読み込む」タブから復元できます。",
+    )
 
     tab_preview, tab_edit = st.tabs(["プレビュー", "HTML編集"])
 
