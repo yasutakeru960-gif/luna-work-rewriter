@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -20,7 +22,7 @@ def _get_secret(key: str) -> str | None:
 
 # API Keys
 ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
-GOOGLE_AI_API_KEY = _get_secret("GOOGLE_AI_API_KEY")
+OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 
 # WordPress
 WP_URL = "https://mixpost.net"
@@ -35,11 +37,15 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_TOKENS = 32000  # Total budget (thinking + output)
 CLAUDE_THINKING_BUDGET = 8000  # Tokens reserved for thinking
 
-# Gemini Image Model (Nano Banana 2 = Gemini 3.1 Flash Image)
-GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
+# OpenAI Image Model (gpt-image-2, released 2026-04-21)
+OPENAI_IMAGE_MODEL = "gpt-image-2"
+OPENAI_IMAGE_QUALITY = "high"  # low / medium / high / auto
+OPENAI_IMAGE_HERO_SIZE = "1536x1024"    # Thumbnail / featured image
+OPENAI_IMAGE_FIGURE_SIZE = "1536x1024"  # In-body figures / diagrams
 
-# Image settings
-IMAGES_PER_ARTICLE = 3
+# Character reference (used to keep the chibi character consistent across figures)
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+CHARACTER_REFERENCE_PATH = ASSETS_DIR / "character_reference.png"
 
 
 def validate_config() -> list[str]:
@@ -47,8 +53,8 @@ def validate_config() -> list[str]:
     errors = []
     if not ANTHROPIC_API_KEY:
         errors.append("ANTHROPIC_API_KEY が設定されていません")
-    if not GOOGLE_AI_API_KEY:
-        errors.append("GOOGLE_AI_API_KEY が設定されていません")
+    if not OPENAI_API_KEY:
+        errors.append("OPENAI_API_KEY が設定されていません")
     if not WP_USERNAME:
         errors.append("WP_USERNAME が設定されていません")
     if not WP_APP_PASSWORD:

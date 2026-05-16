@@ -133,14 +133,31 @@ image_prompt_5: 第4章の画像用の英語プロンプト
 - 十分に長く書いてください。短くまとめすぎないでください。
 - **最重要：1文ごとに<p>タグで囲み、段落間に<p>&nbsp;</p>を入れて余白を作ってください。スマホで読みやすいこまめな改行が必須です。**
 
-## image_promptsについて
-- 必ず英語で記述してください
-- 写真風ではなく、柔らかいイラスト調・フラットデザイン調を指定してください
-- image_prompt_1は記事全体の内容を象徴する、印象的なアイキャッチ画像用のプロンプトにしてください
-- 各章の画像プロンプトは、そのセクションの内容に直接関連した視覚的にわかりやすいイメージにしてください
-- 「soft pastel colors, flat illustration style, minimal, clean design, no text」を全てのプロンプトに含めてください
-- **超重要：人物を描く場合は必ず「Japanese woman」「Japanese style」を指定してください。西洋人風のイラストにしないでください。**
-- **H2セクションの数 + 1（アイキャッチ）分のimage_promptを必ず作成してください**"""
+## image_promptsについて（超重要：2種類のプロンプトを使い分けてください）
+
+すべて **英語で** 記述してください。
+画像は2つの役割に分かれており、求められる内容がまったく違います。
+
+### image_prompt_1 = サムネイル（アイキャッチ／ヒーロー画像）
+- これは記事の **トップに表示される派手なバナー画像** です（YouTubeサムネ風）
+- **記事タイトルの日本語文字が画像内に大きく描き込まれます**（システム側で自動的にタイトルを差し込むので、プロンプトには「the article title prominently rendered as bold Japanese typography」のような指示を含めれば十分です）
+- 内容は、記事のメインテーマ・キャッチコピー・主な訴求点を視覚化する短い英語の説明にしてください
+- 例: "Eye-catching banner thumbnail conveying the idea of starting an AI-powered side business from home, evoking excitement and possibility, with abstract sparkles and elegant accents."
+- 細かい人物配置は指定しなくてOK（システム側のスタイル指示で女性キャラがコーナーに自動配置されます）
+
+### image_prompt_2 以降 = 本文中の図解（インフォグラフィック）
+- これは各H2セクションの内容を **わかりやすく解説する図解** です
+- **同じ女の子キャラクター（紫の瞳、白パーカー、ティールの内シャツ）が毎回登場します**（システム側でリファレンス画像を渡して統一）
+- プロンプトには、その章で説明したい概念・手順・比較を **具体的に視覚化する内容** を書いてください
+- 例（PC内検索の図解）: "Diagram showing the chibi character at her laptop asking 'where is that image?', then a friendly robot AI searching her PC file explorer, then a results panel showing matched image candidates with filenames, file sizes, and folder paths."
+- 例（ChatGPT vs Codex 比較）: "Split-panel comparison diagram. Left side: chibi character chatting with ChatGPT bubble labeled '会話で考えるAI', showing idea brainstorming. Right side: chibi character at laptop with Codex robot, showing autonomous code/test/doc tasks and an accumulating knowledge database."
+- 矢印・吹き出し・UIモック（ノートPC画面、ファイルアイコン、進捗バーなど）・小さな日本語ラベルを含めることを推奨してください
+- 各H2の内容と直接対応させてください（一般的な装飾画像ではなく、その章の内容を補強する図解）
+
+### 共通ルール
+- **H2セクションの数 + 1（サムネ）分のimage_promptを必ず作成してください**
+- 各プロンプトは概ね80〜200語の範囲で具体的に書いてください（短すぎると図解の構成要素が薄くなります）
+- スタイル指定（パステル・フラット・キャラ統一）はシステム側で自動付与するので、プロンプトには **「何を描くか・どう構成するか」のコンテンツ部分だけ** を書けばOKです"""
 
 
 @dataclass

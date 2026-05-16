@@ -1,55 +1,83 @@
 from __future__ import annotations
 
-import textwrap
+import base64
 import time
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 
-from google import genai
-from google.genai import types
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from openai import OpenAI
+from PIL import Image
 
 import config
 
-_client = None
-
-# Japanese fonts - try macOS first, then Linux (Noto Sans CJK)
-_FONT_CANDIDATES_BOLD = [
-    "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
-]
-_FONT_CANDIDATES_MEDIUM = [
-    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Medium.ttc",
-]
-_FONT_CANDIDATES_REGULAR = [
-    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-]
+_client: OpenAI | None = None
 
 
-def _find_font(candidates: list[str]) -> str | None:
-    import os
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-_FONT_BOLD = _find_font(_FONT_CANDIDATES_BOLD)
-_FONT_MEDIUM = _find_font(_FONT_CANDIDATES_MEDIUM)
-_FONT_REGULAR = _find_font(_FONT_CANDIDATES_REGULAR)
-
-
-def _get_client():
+def _get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = genai.Client(api_key=config.GOOGLE_AI_API_KEY)
+        _client = OpenAI(api_key=config.OPENAI_API_KEY)
     return _client
 
+
+# ---------------------------------------------------------------------------
+# Character reference — one persistent chibi character for figure consistency
+# ---------------------------------------------------------------------------
+#
+# The first time `generate_article_images` runs, if `assets/character_reference.png`
+# doesn't exist we generate it from this prompt and save it. Every subsequent
+# in-body figure is generated with `images.edit(image=[character_reference])`
+# so the same girl appears in every diagram.
+#
+# Tweak this prompt and delete the saved PNG if you want a different character.
+
+CHARACTER_REFERENCE_PROMPT = (
+    "A cute Japanese young woman character reference sheet, late teens or early twenties. "
+    "Shoulder-length dark brown hair with subtle purple/violet highlights, "
+    "large expressive purple eyes, friendly warm smile, light skin. "
+    "Wearing a soft white hoodie over a teal/sage green inner shirt. "
+    "Soft pastel anime/manga illustration style, chibi-friendly proportions, "
+    "clean simple plain white background, full upper body shot facing the viewer, "
+    "modern flat-shaded illustration, gentle soft purple accent colors, no text, no labels. "
+    "Designed as a character reference for a Japanese women's lifestyle blog — "
+    "approachable, friendly, easy to recognize, consistent silhouette."
+)
+
+
+# ---------------------------------------------------------------------------
+# Style suffixes appended to user-provided prompts
+# ---------------------------------------------------------------------------
+
+HERO_STYLE_SUFFIX = (
+    "Render this as a flashy, eye-catching Japanese-style article thumbnail / banner. "
+    "Bright purple-to-lavender gradient background with sparkle and starburst particle effects. "
+    "Bold dramatic Japanese typography with the article title prominently displayed in large "
+    "stylized characters, using red/gold/white color accents with subtle outline and shadow. "
+    "Include small decorative ribbon-style badges. "
+    "Place a small cheerful chibi-style Japanese woman character in the corner as a friendly accent. "
+    "Modern catchy YouTube-thumbnail / blog hero banner aesthetic. "
+    "High contrast, polished, professional, suitable as the lead image of a women's lifestyle blog post. "
+    "16:9 horizontal composition."
+)
+
+FIGURE_STYLE_SUFFIX = (
+    "Render this as a friendly, easy-to-understand illustrated explainer diagram, "
+    "in the style of a Japanese women's lifestyle blog infographic. "
+    "Feature the SAME chibi-style young Japanese woman from the reference image — "
+    "keep her hair color, hairstyle, outfit (white hoodie + teal/sage inner), and face style identical. "
+    "She can appear in multiple poses/expressions within one image to walk through the explanation. "
+    "Use rounded speech bubbles, soft purple/lavender accent colors, light pastel background, "
+    "simple flat illustration style, clean labels in Japanese where appropriate, "
+    "arrows and connectors to show flow, and small UI mockups (laptop screens, file icons, "
+    "chat windows, progress bars) where relevant to illustrate the concept. "
+    "Composition should be clear, uncluttered, and instantly readable on a phone."
+)
+
+
+# ---------------------------------------------------------------------------
+# Output container
+# ---------------------------------------------------------------------------
 
 @dataclass
 class GeneratedImage:
@@ -60,300 +88,210 @@ class GeneratedImage:
     pil_image: Image.Image
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def generate_article_images(
     image_prompts: list[str],
     article_title: str = "",
 ) -> list[GeneratedImage]:
-    """Generate images for each prompt using Nano Banana 2."""
-    images = []
-    for i, prompt in enumerate(image_prompts):
-        image = _generate_single_image(prompt, index=i)
-        if image:
-            # For the first image (hero), overlay the article title
-            if i == 0 and article_title:
-                image = _create_title_card(image, article_title)
-            images.append(image)
-        # Brief pause between requests to avoid rate limiting
+    """Generate the hero thumbnail + in-body figures for an article.
+
+    Convention:
+      image_prompts[0]  -> hero / thumbnail (rendered with embedded title text)
+      image_prompts[1:] -> in-body figures (rendered with character reference)
+    """
+    if not image_prompts:
+        return []
+
+    # 1. Make sure we have a character reference on disk
+    reference_path = _ensure_character_reference()
+
+    images: list[GeneratedImage] = []
+
+    # 2. Hero / thumbnail (no reference image — banner-style with title text)
+    hero = _generate_hero(image_prompts[0], article_title, index=0)
+    if hero:
+        images.append(hero)
+    # Brief pause to be polite to the API
+    if len(image_prompts) > 1:
+        time.sleep(1)
+
+    # 3. In-body figures (each uses the character reference)
+    for i, prompt in enumerate(image_prompts[1:], start=1):
+        figure = _generate_figure(prompt, reference_path, index=i)
+        if figure:
+            images.append(figure)
         if i < len(image_prompts) - 1:
-            time.sleep(2)
+            time.sleep(1)
+
     return images
 
 
-def _create_title_card(
-    base_image: GeneratedImage,
-    title: str,
-) -> GeneratedImage:
-    """Create a professional title card with gradient background and illustration."""
-    target_w, target_h = 1200, 630
+# ---------------------------------------------------------------------------
+# Character reference: generate once, persist to assets/
+# ---------------------------------------------------------------------------
 
-    # Create gradient background
-    img = Image.new("RGBA", (target_w, target_h))
-    draw = ImageDraw.Draw(img, "RGBA")
+def _ensure_character_reference() -> Path:
+    """Generate `assets/character_reference.png` if it doesn't exist yet."""
+    path = config.CHARACTER_REFERENCE_PATH
+    if path.exists():
+        return path
 
-    # Draw warm gradient background (coral pink -> soft lavender)
-    for y in range(target_h):
-        ratio = y / target_h
-        r = int(245 - 30 * ratio)  # 245 -> 215
-        g = int(180 - 40 * ratio)  # 180 -> 140
-        b = int(200 + 30 * ratio)  # 200 -> 230
-        draw.rectangle([(0, y), (target_w, y + 1)], fill=(r, g, b, 255))
+    config.ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Place the AI illustration on the right side (semi-transparent)
-    illustration = base_image.pil_image.copy()
-    ill_h = target_h
-    ill_w = int(illustration.width * (ill_h / illustration.height))
-    illustration = illustration.resize((ill_w, ill_h), Image.LANCZOS)
-    if illustration.mode != "RGBA":
-        illustration = illustration.convert("RGBA")
-
-    # Make illustration semi-transparent
-    alpha = illustration.split()[3]
-    alpha = alpha.point(lambda p: int(p * 0.35))  # 35% opacity
-    illustration.putalpha(alpha)
-
-    # Position illustration on the right
-    x_offset = target_w - ill_w + int(ill_w * 0.15)
-    img.paste(illustration, (x_offset, 0), illustration)
-
-    # Re-create draw after paste
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    # Draw title text (dark text on light background)
-    _draw_title_text_styled(draw, title, target_w, target_h)
-
-    # Convert to bytes
-    buf = BytesIO()
-    final_img = img.convert("RGB")  # Remove alpha for final PNG
-    final_img.save(buf, format="PNG", optimize=True)
-    png_bytes = buf.getvalue()
-
-    return GeneratedImage(
-        image_bytes=png_bytes,
-        filename=base_image.filename,
-        mime_type="image/png",
-        prompt=base_image.prompt,
-        pil_image=final_img,
+    png_bytes = _call_generate(
+        prompt=CHARACTER_REFERENCE_PROMPT,
+        size="1024x1024",
+        quality=config.OPENAI_IMAGE_QUALITY,
     )
+    path.write_bytes(png_bytes)
+    return path
 
 
-def _resize_and_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Resize and center-crop image to target dimensions."""
-    # Calculate scale to cover target area
-    scale = max(target_w / img.width, target_h / img.height)
-    new_w = int(img.width * scale)
-    new_h = int(img.height * scale)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
+# ---------------------------------------------------------------------------
+# Hero / thumbnail generation
+# ---------------------------------------------------------------------------
 
-    # Center crop
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    img = img.crop((left, top, left + target_w, top + target_h))
-    return img
-
-
-
-def _draw_title_text_styled(draw: ImageDraw.Draw, title: str, w: int, h: int):
-    """Draw styled article title on a gradient background."""
-    clean_title = title.strip()
-
-    # Split title into lines
-    lines = _split_title_lines(clean_title, max_chars=14)
-
-    # Font size based on line count
-    if len(lines) <= 2:
-        font_size = 52
-    elif len(lines) <= 3:
-        font_size = 44
-    else:
-        font_size = 38
-
-    font = ImageFont.load_default()
-    for candidate in [_FONT_BOLD, _FONT_MEDIUM, _FONT_REGULAR]:
-        if candidate:
-            try:
-                font = ImageFont.truetype(candidate, font_size)
-                break
-            except Exception:
-                continue
-
-    # Calculate text block dimensions
-    line_spacing = int(font_size * 0.6)
-    line_heights = []
-    line_widths = []
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_heights.append(bbox[3] - bbox[1])
-        line_widths.append(bbox[2] - bbox[0])
-
-    total_height = sum(line_heights) + line_spacing * (len(lines) - 1)
-
-    # Position text on the left side (leaving room for illustration on right)
-    text_area_w = int(w * 0.65)
-    y_start = (h - total_height) // 2 - 20
-
-    # Draw a subtle frosted panel behind the text
-    panel_padding = 30
-    max_line_w = max(line_widths) if line_widths else 200
-    panel_x1 = (text_area_w - max_line_w) // 2 - panel_padding
-    panel_y1 = y_start - panel_padding
-    panel_x2 = (text_area_w + max_line_w) // 2 + panel_padding
-    panel_y2 = y_start + total_height + panel_padding
-    draw.rounded_rectangle(
-        [(panel_x1, panel_y1), (panel_x2, panel_y2)],
-        radius=16,
-        fill=(255, 255, 255, 100),
-    )
-
-    # Draw each line
-    for i, line in enumerate(lines):
-        text_w = line_widths[i]
-        x = (text_area_w - text_w) // 2
-        y = y_start + i * (line_heights[0] + line_spacing)
-
-        # Soft shadow
-        draw.text(
-            (x + 1, y + 2),
-            line,
-            fill=(80, 40, 60, 80),
-            font=font,
-        )
-
-        # Main text in dark color
-        draw.text((x, y), line, fill=(60, 30, 50, 255), font=font)
-
-    # Draw "LUNA WORK" branding at bottom center
-    brand_font = ImageFont.load_default()
-    for candidate in [_FONT_MEDIUM, _FONT_REGULAR]:
-        if candidate:
-            try:
-                brand_font = ImageFont.truetype(candidate, 18)
-                break
-            except Exception:
-                continue
-
-    brand_text = "LUNA WORK"
-    brand_bbox = draw.textbbox((0, 0), brand_text, font=brand_font)
-    brand_w = brand_bbox[2] - brand_bbox[0]
-
-    # Brand with decorative line
-    brand_x = (text_area_w - brand_w) // 2
-    brand_y = h - 55
-    line_w = 60
-    draw.line(
-        [(brand_x - line_w - 10, brand_y + 10), (brand_x - 10, brand_y + 10)],
-        fill=(140, 90, 120, 150),
-        width=1,
-    )
-    draw.text((brand_x, brand_y), brand_text, fill=(100, 60, 80, 200), font=brand_font)
-    draw.line(
-        [(brand_x + brand_w + 10, brand_y + 10), (brand_x + brand_w + line_w + 10, brand_y + 10)],
-        fill=(140, 90, 120, 150),
-        width=1,
-    )
-
-
-def _split_title_lines(title: str, max_chars: int = 14) -> list[str]:
-    """Split Japanese title into balanced lines."""
-    if len(title) <= max_chars:
-        return [title]
-
-    lines = []
-    remaining = title
-
-    while remaining:
-        if len(remaining) <= max_chars:
-            lines.append(remaining)
-            break
-
-        # Try to find a natural break point
-        # Look for punctuation or particles near max_chars
-        break_chars = "。、！？」）】のにはをがでと"
-        best_break = max_chars
-
-        # Search around the max_chars position for a good break
-        for offset in range(3):
-            pos = max_chars - offset
-            if pos > 0 and pos < len(remaining):
-                if remaining[pos - 1] in break_chars:
-                    best_break = pos
-                    break
-
-        lines.append(remaining[:best_break])
-        remaining = remaining[best_break:]
-
-    return lines
-
-
-def _generate_single_image(
-    prompt: str, index: int, max_retries: int = 3
+def _generate_hero(
+    user_prompt: str,
+    article_title: str,
+    index: int,
 ) -> GeneratedImage | None:
-    """Generate a single image with retry logic."""
-    # First image (index 0) is the hero/thumbnail background
-    if index == 0:
-        style_suffix = (
-            "Style: beautiful, dreamy background illustration, "
-            "warm and inviting, soft pastel gradient colors, "
-            "modern flat illustration style, high quality, detailed, "
-            "clean composition, no text overlays, no words, "
-            "slightly blurred/soft focus suitable as a background. "
-            "Japanese style, featuring Japanese woman or Japanese cultural elements."
-        )
-    else:
-        style_suffix = (
-            "Style: soft pastel colors, modern flat illustration, "
-            "minimal clean design, warm and friendly, "
-            "suitable for a Japanese women's lifestyle blog, "
-            "no text overlays, high quality. "
-            "Japanese style, featuring Japanese people or Japanese cultural context."
-        )
+    title_clause = (
+        f'The article title text to render prominently in the banner is: "{article_title}". '
+        f"Render this exact Japanese title text crisp and readable inside the image. "
+        if article_title
+        else ""
+    )
 
-    full_prompt = f"{prompt} {style_suffix}"
+    full_prompt = (
+        f"{user_prompt}\n\n"
+        f"{title_clause}"
+        f"{HERO_STYLE_SUFFIX}"
+    )
 
+    png_bytes = _call_generate(
+        prompt=full_prompt,
+        size=config.OPENAI_IMAGE_HERO_SIZE,
+        quality=config.OPENAI_IMAGE_QUALITY,
+    )
+    if not png_bytes:
+        return None
+
+    return _wrap_png(png_bytes, filename=f"article_image_{index + 1}.png", prompt=user_prompt)
+
+
+# ---------------------------------------------------------------------------
+# In-body figure generation (with character reference)
+# ---------------------------------------------------------------------------
+
+def _generate_figure(
+    user_prompt: str,
+    reference_path: Path,
+    index: int,
+) -> GeneratedImage | None:
+    full_prompt = f"{user_prompt}\n\n{FIGURE_STYLE_SUFFIX}"
+
+    png_bytes = _call_edit(
+        prompt=full_prompt,
+        reference_path=reference_path,
+        size=config.OPENAI_IMAGE_FIGURE_SIZE,
+        quality=config.OPENAI_IMAGE_QUALITY,
+    )
+    if not png_bytes:
+        return None
+
+    return _wrap_png(png_bytes, filename=f"article_image_{index + 1}.png", prompt=user_prompt)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI API wrappers with retry
+# ---------------------------------------------------------------------------
+
+def _call_generate(
+    prompt: str,
+    size: str,
+    quality: str,
+    max_retries: int = 3,
+) -> bytes | None:
+    """images.generate — no reference image."""
     for attempt in range(max_retries):
         try:
-            response = _get_client().models.generate_content(
-                model=config.GEMINI_IMAGE_MODEL,
-                contents=[full_prompt],
-                config=types.GenerateContentConfig(
-                    response_modalities=["TEXT", "IMAGE"],
-                ),
+            result = _get_client().images.generate(
+                model=config.OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                n=1,
             )
-
-            if not response.candidates:
-                continue
-
-            for part in response.candidates[0].content.parts:
-                if part.inline_data is not None:
-                    image_data = part.inline_data.data
-                    pil_image = Image.open(BytesIO(image_data))
-
-                    # Ensure good resolution - resize up if too small
-                    min_width = 1200
-                    if pil_image.width < min_width:
-                        ratio = min_width / pil_image.width
-                        new_size = (min_width, int(pil_image.height * ratio))
-                        pil_image = pil_image.resize(new_size, Image.LANCZOS)
-
-                    # Convert to RGBA for potential overlay processing
-                    if pil_image.mode != "RGBA":
-                        pil_image = pil_image.convert("RGBA")
-
-                    # Convert to high-quality PNG bytes
-                    buf = BytesIO()
-                    pil_image.save(buf, format="PNG", optimize=True)
-                    png_bytes = buf.getvalue()
-
-                    return GeneratedImage(
-                        image_bytes=png_bytes,
-                        filename=f"article_image_{index + 1}.png",
-                        mime_type="image/png",
-                        prompt=prompt,
-                        pil_image=pil_image,
-                    )
-
+            return _decode_first(result)
         except Exception:
             if attempt == max_retries - 1:
                 return None
-            time.sleep(3)
-
+            time.sleep(3 * (attempt + 1))
     return None
+
+
+def _call_edit(
+    prompt: str,
+    reference_path: Path,
+    size: str,
+    quality: str,
+    max_retries: int = 3,
+) -> bytes | None:
+    """images.edit — with reference image for character consistency."""
+    for attempt in range(max_retries):
+        try:
+            with open(reference_path, "rb") as fh:
+                result = _get_client().images.edit(
+                    model=config.OPENAI_IMAGE_MODEL,
+                    image=[fh],
+                    prompt=prompt,
+                    size=size,
+                    quality=quality,
+                    input_fidelity="high",
+                    n=1,
+                )
+            return _decode_first(result)
+        except Exception:
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(3 * (attempt + 1))
+    return None
+
+
+def _decode_first(result) -> bytes | None:
+    """gpt-image-2 always returns b64_json."""
+    if not result or not result.data:
+        return None
+    b64 = result.data[0].b64_json
+    if not b64:
+        return None
+    return base64.b64decode(b64)
+
+
+def _wrap_png(png_bytes: bytes, filename: str, prompt: str) -> GeneratedImage:
+    pil = Image.open(BytesIO(png_bytes))
+    if pil.mode != "RGBA":
+        pil = pil.convert("RGBA")
+    return GeneratedImage(
+        image_bytes=png_bytes,
+        filename=filename,
+        mime_type="image/png",
+        prompt=prompt,
+        pil_image=pil,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Utility: regenerate the character reference (call manually if you want
+# to refresh the character look without touching the rest of the pipeline).
+# ---------------------------------------------------------------------------
+
+def regenerate_character_reference() -> Path:
+    """Force-regenerate the character reference image."""
+    if config.CHARACTER_REFERENCE_PATH.exists():
+        config.CHARACTER_REFERENCE_PATH.unlink()
+    return _ensure_character_reference()

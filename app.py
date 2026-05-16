@@ -3,7 +3,7 @@ import streamlit as st
 import config
 from scraper import scrape_article, create_article_from_text
 from rewriter import rewrite_article
-from image_gen import generate_article_images
+from image_gen import generate_article_images, regenerate_character_reference
 from wordpress import (
     test_connection,
     upload_image,
@@ -38,6 +38,25 @@ with st.sidebar:
             st.success(msg)
         else:
             st.error(msg)
+
+    st.divider()
+    st.subheader("キャラクター参照画像")
+    if config.CHARACTER_REFERENCE_PATH.exists():
+        st.image(
+            str(config.CHARACTER_REFERENCE_PATH),
+            caption="本文図解で毎回登場するキャラ",
+            use_container_width=True,
+        )
+        if st.button("キャラを再生成"):
+            with st.spinner("キャラクター参照画像を再生成中..."):
+                try:
+                    regenerate_character_reference()
+                    st.success("再生成しました")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"再生成失敗: {e}")
+    else:
+        st.caption("初回の画像生成時に自動で作成されます")
 
     st.divider()
     st.caption("LUNA WORK Salon")
@@ -182,10 +201,11 @@ if st.session_state.rewritten:
     st.subheader("画像生成")
     st.write("生成する画像のプロンプト:")
     for i, prompt in enumerate(rewritten.image_prompts):
-        st.text(f"{i + 1}. {prompt}")
+        label = "サムネイル" if i == 0 else f"図解 {i}"
+        st.markdown(f"**{i + 1}. [{label}]** {prompt}")
 
     if st.button("画像を生成", type="primary"):
-        with st.spinner(f"Nano Banana 2で{len(rewritten.image_prompts)}枚の画像を生成中...（数分かかります）"):
+        with st.spinner(f"gpt-image-2で{len(rewritten.image_prompts)}枚の画像を生成中...（数分かかります）"):
             try:
                 images = generate_article_images(
                     rewritten.image_prompts,
@@ -202,7 +222,8 @@ if st.session_state.rewritten:
         cols = st.columns(len(st.session_state.images))
         for i, (col, img) in enumerate(zip(cols, st.session_state.images)):
             with col:
-                st.image(img.pil_image, caption=f"画像 {i + 1}")
+                caption = "サムネイル" if i == 0 else f"図解 {i}"
+                st.image(img.pil_image, caption=caption)
 
 # ========================================
 # Step 5: Publish to WordPress
