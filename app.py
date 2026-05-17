@@ -59,12 +59,36 @@ with st.sidebar:
             st.error(msg)
 
     st.divider()
+    st.subheader("画像生成の品質")
+    quality_options = {
+        "low": "節約 (low) — 1枚 約$0.01",
+        "medium": "標準 (medium) — 1枚 約$0.04",
+        "high": "高品質 (high) — 1枚 約$0.19",
+        "auto": "自動 (auto) — モデル任せ",
+    }
+    st.selectbox(
+        "品質",
+        options=list(quality_options.keys()),
+        format_func=lambda k: quality_options[k],
+        index=1,
+        key="image_quality",
+        help="テスト中はlow/medium推奨。本番投稿時にhighへ。",
+    )
+
+    st.divider()
     st.subheader("キャラクター参照画像")
     if config.CHARACTER_REFERENCE_PATH.exists():
         st.image(
             str(config.CHARACTER_REFERENCE_PATH),
             caption="本文図解で毎回登場するキャラ",
             use_container_width=True,
+        )
+        st.download_button(
+            "このキャラ画像を保存",
+            data=config.CHARACTER_REFERENCE_PATH.read_bytes(),
+            file_name="character_reference.png",
+            mime="image/png",
+            help="再デプロイで消える前に手元に保存。次回は下のアップローダーで戻せます。",
         )
         if st.button("キャラを再生成(AI)"):
             with st.spinner("キャラクター参照画像を再生成中..."):
@@ -292,6 +316,7 @@ if st.session_state.rewritten:
                 rewritten.image_prompts,
                 article_title=rewritten.title,
                 progress_callback=_on_progress,
+                quality=st.session_state.get("image_quality", "medium"),
             )
             progress_bar.progress(1.0, text=f"完了: {len(images)}枚生成")
             st.session_state.images = images

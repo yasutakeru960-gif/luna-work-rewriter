@@ -160,6 +160,7 @@ def generate_article_images(
     image_prompts: list[str],
     article_title: str = "",
     progress_callback=None,
+    quality: str | None = None,
 ) -> list[GeneratedImage]:
     """Generate the hero thumbnail + in-body figures for an article.
 
@@ -173,6 +174,7 @@ def generate_article_images(
     if not image_prompts:
         return []
 
+    effective_quality = quality or config.OPENAI_IMAGE_QUALITY
     total_stages = 1 + len(image_prompts)  # 1 char-ref check + N prompts
     stage = 0
 
@@ -192,7 +194,7 @@ def generate_article_images(
     figure_count = max(len(image_prompts) - 1, 0)
 
     _report("サムネを生成中...")
-    hero = _generate_hero(image_prompts[0], article_title, index=0)
+    hero = _generate_hero(image_prompts[0], article_title, index=0, quality=effective_quality)
     if hero:
         images.append(hero)
     if len(image_prompts) > 1:
@@ -200,7 +202,9 @@ def generate_article_images(
 
     for i, prompt in enumerate(image_prompts[1:], start=1):
         _report(f"図解 {i}/{figure_count} を生成中...")
-        figure = _generate_figure(prompt, reference_path, index=i)
+        figure = _generate_figure(
+            prompt, reference_path, index=i, quality=effective_quality
+        )
         if figure:
             images.append(figure)
         if i < figure_count:
@@ -238,6 +242,7 @@ def _generate_hero(
     user_prompt: str,
     article_title: str,
     index: int,
+    quality: str | None = None,
 ) -> GeneratedImage | None:
     title_clause = (
         f'The article title text to render prominently in the banner is: "{article_title}". '
@@ -255,7 +260,7 @@ def _generate_hero(
     png_bytes = _call_generate(
         prompt=full_prompt,
         size=config.OPENAI_IMAGE_HERO_SIZE,
-        quality=config.OPENAI_IMAGE_QUALITY,
+        quality=quality or config.OPENAI_IMAGE_QUALITY,
     )
     if not png_bytes:
         return None
@@ -271,6 +276,7 @@ def _generate_figure(
     user_prompt: str,
     reference_path: Path,
     index: int,
+    quality: str | None = None,
 ) -> GeneratedImage | None:
     full_prompt = f"{user_prompt}\n\n{FIGURE_STYLE_SUFFIX}"
 
@@ -278,7 +284,7 @@ def _generate_figure(
         prompt=full_prompt,
         reference_path=reference_path,
         size=config.OPENAI_IMAGE_FIGURE_SIZE,
-        quality=config.OPENAI_IMAGE_QUALITY,
+        quality=quality or config.OPENAI_IMAGE_QUALITY,
     )
     if not png_bytes:
         return None
