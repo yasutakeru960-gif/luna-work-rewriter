@@ -312,11 +312,18 @@ if st.session_state.rewritten:
     ]
     quality_choice = st.session_state.get("image_quality", "medium")
 
-    # Normalize image_styles length (e.g. loaded from older JSON drafts)
-    styles_list = list(rewritten.image_styles) if rewritten.image_styles else []
+    # Normalize image_styles length. Use getattr so that an in-memory
+    # RewrittenArticle pickled before the field existed (e.g. session_state
+    # carried over from an older deploy) doesn't crash with AttributeError.
+    existing_styles = getattr(rewritten, "image_styles", None) or []
+    styles_list = list(existing_styles)
     while len(styles_list) < len(rewritten.image_prompts):
         styles_list.append("hero" if len(styles_list) == 0 else "figure")
-    rewritten.image_styles = styles_list
+    try:
+        rewritten.image_styles = styles_list
+    except AttributeError:
+        # Frozen / slotted dataclass — fine, we still have styles_list below
+        pass
 
     _style_label = {"hero": "サムネ", "figure": "図解", "operation": "操作画面"}
 
