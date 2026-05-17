@@ -13,11 +13,19 @@ import config
 
 _client: OpenAI | None = None
 
+# Per-request hard timeout. gpt-image-2 high quality usually finishes in
+# 20-60s; 180s gives margin for slow runs without letting a stuck request
+# hang the whole UI for hours.
+OPENAI_REQUEST_TIMEOUT = 180.0
+
 
 def _get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(api_key=config.OPENAI_API_KEY)
+        _client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            timeout=OPENAI_REQUEST_TIMEOUT,
+        )
     return _client
 
 
@@ -151,35 +159,51 @@ class GeneratedImage:
 def generate_article_images(
     image_prompts: list[str],
     article_title: str = "",
+    progress_callback=None,
 ) -> list[GeneratedImage]:
     """Generate the hero thumbnail + in-body figures for an article.
 
     Convention:
       image_prompts[0]  -> hero / thumbnail (rendered with embedded title text)
       image_prompts[1:] -> in-body figures (rendered with character reference)
+
+    progress_callback(stage_index, total_stages, description) is invoked
+    before each generation step so the caller can update a progress bar.
     """
     if not image_prompts:
         return []
 
-    # 1. Make sure we have a character reference on disk
+    total_stages = 1 + len(image_prompts)  # 1 char-ref check + N prompts
+    stage = 0
+
+    def _report(desc: str):
+        nonlocal stage
+        stage += 1
+        if progress_callback:
+            try:
+                progress_callback(stage, total_stages, desc)
+            except Exception:
+                pass
+
+    _report("キャラクター参照画像を準備中...")
     reference_path = _ensure_character_reference()
 
     images: list[GeneratedImage] = []
+    figure_count = max(len(image_prompts) - 1, 0)
 
-    # 2. Hero / thumbnail (no reference image — banner-style with title text)
+    _report("サムネを生成中...")
     hero = _generate_hero(image_prompts[0], article_title, index=0)
     if hero:
         images.append(hero)
-    # Brief pause to be polite to the API
     if len(image_prompts) > 1:
         time.sleep(1)
 
-    # 3. In-body figures (each uses the character reference)
     for i, prompt in enumerate(image_prompts[1:], start=1):
+        _report(f"図解 {i}/{figure_count} を生成中...")
         figure = _generate_figure(prompt, reference_path, index=i)
         if figure:
             images.append(figure)
-        if i < len(image_prompts) - 1:
+        if i < figure_count:
             time.sleep(1)
 
     return images

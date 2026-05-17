@@ -278,17 +278,28 @@ if st.session_state.rewritten:
         st.markdown(f"**{i + 1}. [{label}]** {prompt}")
 
     if st.button("画像を生成", type="primary"):
-        with st.spinner(f"gpt-image-2で{len(rewritten.image_prompts)}枚の画像を生成中...（数分かかります）"):
-            try:
-                images = generate_article_images(
-                    rewritten.image_prompts,
-                    article_title=rewritten.title,
-                )
-                st.session_state.images = images
-                st.session_state.wp_post = None
-                st.success(f"{len(images)}枚の画像を生成しました")
-            except Exception as e:
-                st.error(f"画像生成失敗: {e}")
+        if len(rewritten.image_prompts) > 6:
+            st.warning(
+                f"画像が{len(rewritten.image_prompts)}枚あります。"
+                f"1枚あたり30〜60秒かかるため、合計で{len(rewritten.image_prompts) * 45 // 60}分前後の見込みです。"
+            )
+        progress_bar = st.progress(0.0, text="準備中...")
+        try:
+            def _on_progress(stage, total, desc):
+                progress_bar.progress(min(stage / total, 1.0), text=desc)
+
+            images = generate_article_images(
+                rewritten.image_prompts,
+                article_title=rewritten.title,
+                progress_callback=_on_progress,
+            )
+            progress_bar.progress(1.0, text=f"完了: {len(images)}枚生成")
+            st.session_state.images = images
+            st.session_state.wp_post = None
+            st.success(f"{len(images)}枚の画像を生成しました")
+        except Exception as e:
+            progress_bar.empty()
+            st.error(f"画像生成失敗: {e}")
 
     # Show generated images
     if st.session_state.images:
