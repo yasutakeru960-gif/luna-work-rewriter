@@ -7,7 +7,8 @@ import config
 from scraper import scrape_article, create_article_from_text, ScrapedArticle
 from rewriter import rewrite_article, RewrittenArticle
 from image_gen import (
-    generate_article_images,
+    generate_article_images_parallel,
+    generate_one_image,
     regenerate_character_reference,
     save_uploaded_character_reference,
 )
@@ -296,48 +297,138 @@ if st.session_state.rewritten:
 
     # Image generation
     st.subheader("画像生成")
-    st.write("生成する画像のプロンプト:")
-    for i, prompt in enumerate(rewritten.image_prompts):
-        label = "サムネイル" if i == 0 else f"図解 {i}"
-        st.markdown(f"**{i + 1}. [{label}]** {prompt}")
 
-    if st.button("画像を生成", type="primary"):
-        if len(rewritten.image_prompts) > 6:
-            st.warning(
-                f"画像が{len(rewritten.image_prompts)}枚あります。"
-                f"1枚あたり30〜60秒かかるため、合計で{len(rewritten.image_prompts) * 45 // 60}分前後の見込みです。"
+    # Initialize slots whenever the prompt list shape changes
+    total_imgs = len(rewritten.image_prompts)
+    if (
+        not isinstance(st.session_state.images, list)
+        or len(st.session_state.images) != total_imgs
+    ):
+        st.session_state.images = [None] * total_imgs
+
+    done_count = sum(1 for img in st.session_state.images if img is not None)
+    remaining_indices = [
+        i for i, img in enumerate(st.session_state.images) if img is None
+    ]
+    quality_choice = st.session_state.get("image_quality", "medium")
+
+    with st.expander("生成プロンプト一覧", expanded=False):
+        for i, prompt in enumerate(rewritten.image_prompts):
+            label = "サムネイル" if i == 0 else f"図解 {i}"
+            st.markdown(f"**{i + 1}. [{label}]** {prompt}")
+
+    # Top-level generate / resume button
+    if remaining_indices:
+        button_label = (
+            f"画像を生成 ({total_imgs}枚 / 並列3)"
+            if done_count == 0
+            else f"残り{len(remaining_indices)}枚を生成 (生成済み {done_count}/{total_imgs})"
+        )
+        if total_imgs >= 7 and done_count == 0:
+            st.caption(
+                f"※ {total_imgs}枚 × 約45秒 ÷ 3並列 ≈ "
+                f"おおむね {max(total_imgs * 45 // 60 // 3, 1)} 分前後で完了します。"
             )
-        progress_bar = st.progress(0.0, text="準備中...")
-        try:
-            def _on_progress(stage, total, desc):
-                progress_bar.progress(min(stage / total, 1.0), text=desc)
-
-            images = generate_article_images(
-                rewritten.image_prompts,
-                article_title=rewritten.title,
-                progress_callback=_on_progress,
-                quality=st.session_state.get("image_quality", "medium"),
+        if st.button(button_label, type="primary", key="btn_gen_images"):
+            progress_bar = st.progress(
+                done_count / total_imgs if total_imgs else 0.0,
+                text=f"生成中... 完了 {done_count}/{total_imgs}",
             )
-            progress_bar.progress(1.0, text=f"完了: {len(images)}枚生成")
-            st.session_state.images = images
-            st.session_state.wp_post = None
-            st.success(f"{len(images)}枚の画像を生成しました")
-        except Exception as e:
-            progress_bar.empty()
-            st.error(f"画像生成失敗: {e}")
+            completed = [done_count]
+            failures: list[tuple[int, Exception]] = []
 
-    # Show generated images
-    if st.session_state.images:
-        cols = st.columns(len(st.session_state.images))
-        for i, (col, img) in enumerate(zip(cols, st.session_state.images)):
-            with col:
-                caption = "サムネイル" if i == 0 else f"図解 {i}"
-                st.image(img.pil_image, caption=caption)
+            def _on_complete(idx, img):
+                st.session_state.images[idx] = img
+                completed[0] += 1
+                progress_bar.progress(
+                    completed[0] / total_imgs,
+                    text=f"生成中... 完了 {completed[0]}/{total_imgs}",
+                )
+
+            def _on_failure(idx, err):
+                failures.append((idx, err))
+
+            try:
+                generate_article_images_parallel(
+                    image_prompts=rewritten.image_prompts,
+                    article_title=rewritten.title,
+                    indices=remaining_indices,
+                    quality=quality_choice,
+                    max_workers=3,
+                    on_complete=_on_complete,
+                    on_failure=_on_failure,
+                )
+            except Exception as e:
+                progress_bar.empty()
+                st.error(f"画像生成中に予期せぬエラー: {e}")
+            else:
+                progress_bar.progress(
+                    completed[0] / total_imgs if total_imgs else 1.0,
+                    text=f"完了 {completed[0]}/{total_imgs}",
+                )
+                if failures:
+                    for idx, err in failures:
+                        label = "サムネ" if idx == 0 else f"図解 {idx}"
+                        st.error(
+                            f"{label} (画像 {idx + 1}) 失敗: {err}。"
+                            f"画像カード下の「再生成」ボタンで個別にリトライできます。"
+                        )
+                else:
+                    st.success(f"{completed[0]}枚の画像を生成しました")
+                st.session_state.wp_post = None
+                st.rerun()
+    else:
+        st.success(f"全{total_imgs}枚生成済み — 各カード下の「再生成」で差し替えできます")
+
+    # Per-image grid with regen buttons
+    if total_imgs > 0:
+        per_row = 3
+        for row_start in range(0, total_imgs, per_row):
+            row = st.columns(per_row)
+            for col_offset in range(per_row):
+                i = row_start + col_offset
+                if i >= total_imgs:
+                    break
+                with row[col_offset]:
+                    label = "サムネイル" if i == 0 else f"図解 {i}"
+                    img = st.session_state.images[i]
+                    if img is not None:
+                        st.image(img.pil_image, caption=f"{i + 1}. {label}")
+                    else:
+                        st.warning(f"{i + 1}. {label} — 未生成")
+                    if st.button(
+                        "再生成",
+                        key=f"regen_img_{i}",
+                        help="この1枚だけを生成し直します",
+                    ):
+                        with st.spinner(f"{label} を再生成中..."):
+                            try:
+                                new_img = generate_one_image(
+                                    image_prompts=rewritten.image_prompts,
+                                    index=i,
+                                    article_title=rewritten.title,
+                                    quality=quality_choice,
+                                )
+                                if new_img is not None:
+                                    st.session_state.images[i] = new_img
+                                    st.session_state.wp_post = None
+                                    st.rerun()
+                                else:
+                                    st.error("画像が返ってきませんでした")
+                            except Exception as e:
+                                st.error(f"再生成失敗: {e}")
 
 # ========================================
 # Step 5: Publish to WordPress
 # ========================================
-if st.session_state.rewritten and st.session_state.images:
+_ready_to_publish = (
+    st.session_state.rewritten
+    and isinstance(st.session_state.images, list)
+    and len(st.session_state.images) > 0
+    and all(img is not None for img in st.session_state.images)
+)
+
+if _ready_to_publish:
     st.header("Step 5: WordPressに投稿")
 
     publish_status = st.radio(

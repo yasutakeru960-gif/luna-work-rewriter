@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -155,6 +156,86 @@ class GeneratedImage:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
+def generate_one_image(
+    image_prompts: list[str],
+    index: int,
+    article_title: str = "",
+    quality: str | None = None,
+) -> GeneratedImage | None:
+    """Generate a single image at the given index in the prompts list.
+
+    index == 0 -> hero / thumbnail (images.generate)
+    index >= 1 -> in-body figure (images.edit with character reference)
+    Raises on permanent API failure; returns None only if the index is out of range.
+    """
+    if index < 0 or index >= len(image_prompts):
+        return None
+    prompt = image_prompts[index]
+    effective_quality = quality or config.OPENAI_IMAGE_QUALITY
+    if index == 0:
+        return _generate_hero(prompt, article_title, index=0, quality=effective_quality)
+    reference_path = _ensure_character_reference()
+    return _generate_figure(
+        prompt, reference_path, index=index, quality=effective_quality
+    )
+
+
+def generate_article_images_parallel(
+    image_prompts: list[str],
+    article_title: str,
+    indices: list[int],
+    quality: str | None = None,
+    max_workers: int = 3,
+    on_complete=None,
+    on_failure=None,
+) -> dict[int, GeneratedImage]:
+    """Generate images at the given indices in parallel using a thread pool.
+
+    Callbacks fire from the main thread as each future completes:
+      on_complete(index, GeneratedImage)
+      on_failure(index, Exception)
+
+    Returns a dict of index -> GeneratedImage for all successful generations.
+    """
+    if not indices:
+        return {}
+
+    # If a figure index is requested, ensure character reference is on disk
+    # BEFORE spawning parallel workers, so we don't race to generate it.
+    if any(i >= 1 for i in indices):
+        _ensure_character_reference()
+
+    results: dict[int, GeneratedImage] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                generate_one_image,
+                image_prompts,
+                idx,
+                article_title,
+                quality,
+            ): idx
+            for idx in indices
+        }
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                img = fut.result()
+                if img is None:
+                    if on_failure:
+                        on_failure(idx, RuntimeError("No image returned"))
+                else:
+                    results[idx] = img
+                    if on_complete:
+                        on_complete(idx, img)
+            except Exception as e:
+                if on_failure:
+                    on_failure(idx, e)
+
+    return results
+
 
 def generate_article_images(
     image_prompts: list[str],
