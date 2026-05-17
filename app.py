@@ -6,7 +6,11 @@ import streamlit as st
 import config
 from scraper import scrape_article, create_article_from_text, ScrapedArticle
 from rewriter import rewrite_article, RewrittenArticle
-from image_gen import generate_article_images, regenerate_character_reference
+from image_gen import (
+    generate_article_images,
+    regenerate_character_reference,
+    save_uploaded_character_reference,
+)
 from wordpress import (
     test_connection,
     upload_image,
@@ -62,7 +66,7 @@ with st.sidebar:
             caption="本文図解で毎回登場するキャラ",
             use_container_width=True,
         )
-        if st.button("キャラを再生成"):
+        if st.button("キャラを再生成(AI)"):
             with st.spinner("キャラクター参照画像を再生成中..."):
                 try:
                     regenerate_character_reference()
@@ -72,6 +76,26 @@ with st.sidebar:
                     st.error(f"再生成失敗: {e}")
     else:
         st.caption("初回の画像生成時に自動で作成されます")
+
+    with st.expander("自分で用意した画像をキャラに使う"):
+        st.caption(
+            "AIで生成したキャラがイメージと違う場合、好みのイラストをアップロードしてください。"
+            "以降の図解は、その画像のキャラ・絵柄に寄せて生成されます。"
+        )
+        uploaded_char = st.file_uploader(
+            "PNG または JPG",
+            type=["png", "jpg", "jpeg"],
+            key="char_upload",
+        )
+        if uploaded_char is not None and st.button(
+            "この画像をキャラとして使う", key="btn_char_upload"
+        ):
+            try:
+                save_uploaded_character_reference(uploaded_char.read())
+                st.success("参照画像を更新しました")
+                st.rerun()
+            except Exception as e:
+                st.error(f"アップロード失敗: {e}")
 
     st.divider()
     st.caption("LUNA WORK Salon")
