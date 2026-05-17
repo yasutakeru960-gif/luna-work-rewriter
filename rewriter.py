@@ -241,7 +241,75 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
     # Apply inline styles for WordPress compatibility
     result.html_content = _apply_inline_styles(result.html_content)
 
+    # Defense in depth: guarantee every H2 has an IMAGE_PLACEHOLDER immediately
+    # after it, even if Claude forgot. Missing placeholders get auto-inserted
+    # with generic prompts derived from the H2 text.
+    result.html_content, result.image_prompts = _ensure_h2_have_placeholders(
+        result.html_content, result.image_prompts
+    )
+
     return result
+
+
+def _ensure_h2_have_placeholders(
+    html: str,
+    image_prompts: list[str],
+) -> tuple[str, list[str]]:
+    """Guarantee every H2 in the HTML is immediately followed by an
+    IMAGE_PLACEHOLDER comment.
+
+    For each H2 that doesn't already have one, inserts a placeholder with the
+    next available sequential number and appends a generic image prompt derived
+    from the H2 title text.
+    """
+    h2_pattern = re.compile(r"(<h2[^>]*>)(.*?)(</h2>)", re.DOTALL | re.IGNORECASE)
+    after_h2_placeholder = re.compile(
+        r"^\s*<!--\s*IMAGE_PLACEHOLDER_\d+\s*-->", re.IGNORECASE
+    )
+    existing_num = re.compile(
+        r"<!--\s*IMAGE_PLACEHOLDER_(\d+)\s*-->", re.IGNORECASE
+    )
+
+    existing_numbers = [int(m.group(1)) for m in existing_num.finditer(html)]
+    next_num = (max(existing_numbers) + 1) if existing_numbers else 1
+
+    parts: list[str] = []
+    cursor = 0
+    new_prompts = list(image_prompts)
+    inserted = 0
+
+    for m in h2_pattern.finditer(html):
+        h2_end = m.end()
+        h2_inner = m.group(2)
+        h2_text = re.sub(r"<[^>]+>", "", h2_inner).strip()
+
+        parts.append(html[cursor:h2_end])
+        cursor = h2_end
+
+        rest_after_h2 = html[h2_end:]
+        if after_h2_placeholder.match(rest_after_h2):
+            continue
+
+        parts.append(f"\n<!-- IMAGE_PLACEHOLDER_{next_num} -->\n")
+        new_prompts.append(
+            f"Friendly explainer illustration for the article section titled: "
+            f'"{h2_text}". Visualize the main concept of this section with '
+            f"the recurring chibi character demonstrating the idea, plus relevant "
+            f"icons or UI elements that match the topic."
+        )
+        next_num += 1
+        inserted += 1
+
+    parts.append(html[cursor:])
+
+    if inserted:
+        # Log to stdout so it shows up in Streamlit Cloud logs when debugging.
+        print(
+            f"[rewriter] Auto-inserted {inserted} IMAGE_PLACEHOLDER(s) for H2s "
+            f"that Claude missed."
+        )
+
+    return "".join(parts), new_prompts
 
 
 def _build_user_prompt(article: ScrapedArticle) -> str:
