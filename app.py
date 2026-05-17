@@ -312,9 +312,18 @@ if st.session_state.rewritten:
     ]
     quality_choice = st.session_state.get("image_quality", "medium")
 
+    # Normalize image_styles length (e.g. loaded from older JSON drafts)
+    styles_list = list(rewritten.image_styles) if rewritten.image_styles else []
+    while len(styles_list) < len(rewritten.image_prompts):
+        styles_list.append("hero" if len(styles_list) == 0 else "figure")
+    rewritten.image_styles = styles_list
+
+    _style_label = {"hero": "サムネ", "figure": "図解", "operation": "操作画面"}
+
     with st.expander("生成プロンプト一覧", expanded=False):
         for i, prompt in enumerate(rewritten.image_prompts):
-            label = "サムネイル" if i == 0 else f"図解 {i}"
+            style = styles_list[i] if i < len(styles_list) else "figure"
+            label = _style_label.get(style, "図解")
             st.markdown(f"**{i + 1}. [{label}]** {prompt}")
 
     # Top-level generate / resume button
@@ -357,6 +366,7 @@ if st.session_state.rewritten:
                     max_workers=3,
                     on_complete=_on_complete,
                     on_failure=_on_failure,
+                    image_styles=styles_list,
                 )
             except Exception as e:
                 progress_bar.empty()
@@ -390,7 +400,9 @@ if st.session_state.rewritten:
                 if i >= total_imgs:
                     break
                 with row[col_offset]:
-                    label = "サムネイル" if i == 0 else f"図解 {i}"
+                    style_i = styles_list[i] if i < len(styles_list) else "figure"
+                    style_label = _style_label.get(style_i, "図解")
+                    label = f"{style_label} {i}" if i > 0 else "サムネイル"
                     img = st.session_state.images[i]
                     if img is not None:
                         st.image(img.pil_image, caption=f"{i + 1}. {label}")
@@ -408,6 +420,7 @@ if st.session_state.rewritten:
                                     index=i,
                                     article_title=rewritten.title,
                                     quality=quality_choice,
+                                    image_styles=styles_list,
                                 )
                                 if new_img is not None:
                                     st.session_state.images[i] = new_img

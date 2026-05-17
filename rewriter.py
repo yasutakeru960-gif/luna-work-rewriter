@@ -130,6 +130,37 @@ image_prompt_5: 第4章の画像用の英語プロンプト
   - 重要な概念の説明直後
 - 中盤画像も連番に組み込みます。例えば下記参照
 
+### 推奨ルール4: 重要なH3にも画像（操作手順では必須）
+- H3の中で **次のいずれか** に当てはまるものには、H3直後にも `<!-- IMAGE_PLACEHOLDER_N -->` を入れてください:
+  - **実際のアプリ画面・Web画面の操作手順を説明している**(例: 「商品を出品する手順」「アカウント登録のやり方」「設定画面の開き方」) ← 必須
+  - **特定のボタン・メニュー・フォーム入力を解説している**
+  - **画面のどこを見るかの説明**
+- 「概念の解説だけのH3」「短いH3(150文字以下)」には画像は不要
+- H3画像も連番に組み込みます
+
+### 画像スタイル指定(超重要)
+すべての画像プロンプトに **画像スタイル** を指定してください。3種類あります:
+
+- **hero**: 記事先頭のアイキャッチバナー(image_prompt_1 は必ずこれ。明示不要)
+- **figure**: キャラクター(女性誌コラム風の手描きキャラ)を使った概念説明・図解(デフォルト)
+- **operation**: 実際のアプリ/Web画面のリアルなUIモック+赤い注釈+「ここをタップ」など。キャラは出ない、UI画面の操作手順を見せるためのスタイル
+
+判断基準:
+- ユーザーが画面を見ながら指示通りに操作する系 → **operation**
+- 抽象概念、心情、比較、フロー図、ストーリー → **figure**
+
+metadata部分に **`image_style_N: figure` または `image_style_N: operation`** を、各 image_prompt_N に対応する形で書いてください(image_prompt_1 のhero は省略OK)。
+
+例:
+```
+image_prompt_2: アクセサリー副業の魅力を表現する図。キャラが嬉しそうに商品を持っている様子と、家から始められることを示す家のアイコン、スマホアイコンを並べる
+image_style_2: figure
+image_prompt_3: monomyアプリのトップ画面から「商品を作成する」ボタンをタップする手順を、3画面のステップに分けて表示
+image_style_3: operation
+image_prompt_4: 売上のグラフが右肩上がりに伸びていくのを、キャラが嬉しそうに見ている様子
+image_style_4: figure
+```
+
 ### 配置例（H2が3つ、うち1つが長文の場合 = 合計5枚）
 ```
 <!-- IMAGE_PLACEHOLDER_1 -->                ← アイキャッチ
@@ -209,6 +240,11 @@ class RewrittenArticle:
     html_content: str
     meta_description: str
     image_prompts: list[str] = field(default_factory=list)
+    # Style per image, aligned 1:1 with image_prompts.
+    #   "hero"      = thumbnail banner (always index 0)
+    #   "figure"    = character-illustrated explainer (default)
+    #   "operation" = realistic UI walkthrough with annotations (no character)
+    image_styles: list[str] = field(default_factory=list)
     slug: str = ""
 
 
@@ -244,8 +280,12 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
     # Defense in depth: guarantee every H2 has an IMAGE_PLACEHOLDER immediately
     # after it, even if Claude forgot. Missing placeholders get auto-inserted
     # with generic prompts derived from the H2 text.
-    result.html_content, result.image_prompts = _ensure_h2_have_placeholders(
-        result.html_content, result.image_prompts
+    (
+        result.html_content,
+        result.image_prompts,
+        result.image_styles,
+    ) = _ensure_h2_have_placeholders(
+        result.html_content, result.image_prompts, result.image_styles
     )
 
     return result
@@ -254,7 +294,8 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
 def _ensure_h2_have_placeholders(
     html: str,
     image_prompts: list[str],
-) -> tuple[str, list[str]]:
+    image_styles: list[str] | None = None,
+) -> tuple[str, list[str], list[str]]:
     """Guarantee every H2 in the HTML is immediately followed by an
     IMAGE_PLACEHOLDER comment.
 
@@ -276,6 +317,11 @@ def _ensure_h2_have_placeholders(
     parts: list[str] = []
     cursor = 0
     new_prompts = list(image_prompts)
+    new_styles = list(image_styles) if image_styles else []
+    # Make sure styles array is at least as long as prompts before we start
+    # appending; backfill any missing slots with the default "figure".
+    while len(new_styles) < len(new_prompts):
+        new_styles.append("figure" if len(new_styles) > 0 else "hero")
     inserted = 0
 
     for m in h2_pattern.finditer(html):
@@ -297,6 +343,7 @@ def _ensure_h2_have_placeholders(
             f"the recurring chibi character demonstrating the idea, plus relevant "
             f"icons or UI elements that match the topic."
         )
+        new_styles.append("figure")
         next_num += 1
         inserted += 1
 
@@ -309,7 +356,7 @@ def _ensure_h2_have_placeholders(
             f"that Claude missed."
         )
 
-    return "".join(parts), new_prompts
+    return "".join(parts), new_prompts, new_styles
 
 
 def _build_user_prompt(article: ScrapedArticle) -> str:
@@ -430,10 +477,20 @@ def _parse_response(text: str) -> RewrittenArticle:
 
     # Extract ALL image prompts (dynamic count - not just 1-3)
     image_prompts = []
+    image_styles = []
     for i in range(1, 30):  # Support up to 29 images
         prompt = extract_field(metadata_block, f"image_prompt_{i}")
         if prompt:
             image_prompts.append(prompt)
+            raw_style = extract_field(metadata_block, f"image_style_{i}").lower().strip()
+            if i == 1:
+                image_styles.append("hero")
+            elif raw_style == "operation":
+                image_styles.append("operation")
+            elif raw_style == "figure":
+                image_styles.append("figure")
+            else:
+                image_styles.append("figure")  # default for anything unrecognized
         elif i > 3:
             # After prompt 3, stop if we hit a gap
             break
@@ -451,5 +508,6 @@ def _parse_response(text: str) -> RewrittenArticle:
         html_content=html_content,
         meta_description=meta_description,
         image_prompts=image_prompts,
+        image_styles=image_styles,
         slug=slug,
     )

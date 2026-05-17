@@ -99,6 +99,45 @@ HERO_STYLE_SUFFIX = (
     "16:9 horizontal composition."
 )
 
+OPERATION_STYLE_SUFFIX = (
+    "Render this as a clear UI walkthrough image — the kind of image you'd see in a "
+    "Japanese how-to blog post explaining step by step how to use an app or website. "
+    "\n\n"
+    "==== CRITICAL — what this is NOT: ==== "
+    "NOT a character illustration. NOT chibi. NOT anime. NOT an editorial cartoon. "
+    "The recurring chibi character must NOT appear in this image. "
+    "This is purely a UI demonstration, not a story scene. "
+    "\n\n"
+    "==== CRITICAL — what this IS: ==== "
+    "A realistic-looking but stylized mockup of the actual app screen or web page "
+    "being explained. "
+    "Show the interface elements relevant to the action — buttons, menus, forms, "
+    "input fields, modals, lists, navigation bars. "
+    "Modern UI with realistic colors, subtle drop shadows, rounded corners. "
+    "Smartphone screen frame OR desktop browser window frame, whichever fits the context. "
+    "Light gray or white surrounding background. "
+    "\n\n"
+    "==== Annotation overlay (the hand-holding part): ==== "
+    "Add red or orange annotation overlays on top of the UI to guide the reader: "
+    "Red or orange circles / rounded rectangles highlighting the exact button or "
+    "field to tap or fill in. "
+    "Arrows pointing from explanation labels to the relevant UI element. "
+    "Numbered step markers ①②③ for sequential steps. "
+    "Hand-lettered Japanese callout text (e.g. ここをタップ / メールアドレスを入力 / "
+    "「登録する」を押す / 次へ進む / これを選択 / ① 商品名を入力) integrated as "
+    "floating labels with simple background. "
+    "\n\n"
+    "==== Composition: ==== "
+    "If showing a single screen with one main action: one phone or desktop mockup, "
+    "centered, with annotations. "
+    "If showing a sequence of 2-3 steps: arrange screens horizontally or in a small "
+    "grid, each labeled STEP 1 / STEP 2 / STEP 3. "
+    "Plenty of white space, easy to read on a phone, focus on the action being taught. "
+    "\n\n"
+    "Overall feel: a helpful, instantly understandable Japanese app/web how-to image."
+)
+
+
 FIGURE_STYLE_SUFFIX = (
     "Render this as a hand-drawn cartoon-manga illustration in the style of a Japanese "
     "essay comic / weekly ladies' magazine column cut illustration "
@@ -157,24 +196,44 @@ class GeneratedImage:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _resolve_style(
+    image_styles: list[str] | None, index: int, default: str
+) -> str:
+    if image_styles and 0 <= index < len(image_styles):
+        s = (image_styles[index] or "").lower().strip()
+        if s in ("hero", "figure", "operation"):
+            return s
+    return default
+
+
 def generate_one_image(
     image_prompts: list[str],
     index: int,
     article_title: str = "",
     quality: str | None = None,
+    image_styles: list[str] | None = None,
 ) -> GeneratedImage | None:
     """Generate a single image at the given index in the prompts list.
 
-    index == 0 -> hero / thumbnail (images.generate)
-    index >= 1 -> in-body figure (images.edit with character reference)
-    Raises on permanent API failure; returns None only if the index is out of range.
+    Routing based on image_styles[index]:
+      "hero"      (default for index 0) -> _generate_hero, no reference image
+      "figure"    (default for index>=1) -> _generate_figure, character ref
+      "operation"                        -> _generate_operation, no ref, UI mockup
+
+    Returns None only if the index is out of range; permanent API failures raise.
     """
     if index < 0 or index >= len(image_prompts):
         return None
     prompt = image_prompts[index]
     effective_quality = quality or config.OPENAI_IMAGE_QUALITY
-    if index == 0:
-        return _generate_hero(prompt, article_title, index=0, quality=effective_quality)
+    style = _resolve_style(
+        image_styles, index, default="hero" if index == 0 else "figure"
+    )
+
+    if style == "hero" or index == 0:
+        return _generate_hero(prompt, article_title, index=index, quality=effective_quality)
+    if style == "operation":
+        return _generate_operation(prompt, index=index, quality=effective_quality)
     reference_path = _ensure_character_reference()
     return _generate_figure(
         prompt, reference_path, index=index, quality=effective_quality
@@ -189,6 +248,7 @@ def generate_article_images_parallel(
     max_workers: int = 3,
     on_complete=None,
     on_failure=None,
+    image_styles: list[str] | None = None,
 ) -> dict[int, GeneratedImage]:
     """Generate images at the given indices in parallel using a thread pool.
 
@@ -201,9 +261,13 @@ def generate_article_images_parallel(
     if not indices:
         return {}
 
-    # If a figure index is requested, ensure character reference is on disk
-    # BEFORE spawning parallel workers, so we don't race to generate it.
-    if any(i >= 1 for i in indices):
+    # Only materialize the character reference when at least one figure-style
+    # image will need it; doing it up-front avoids a thread race.
+    needs_char_ref = any(
+        _resolve_style(image_styles, i, default="figure") == "figure" and i >= 1
+        for i in indices
+    )
+    if needs_char_ref:
         _ensure_character_reference()
 
     results: dict[int, GeneratedImage] = {}
@@ -216,6 +280,7 @@ def generate_article_images_parallel(
                 idx,
                 article_title,
                 quality,
+                image_styles,
             ): idx
             for idx in indices
         }
@@ -352,6 +417,27 @@ def _generate_hero(
 # ---------------------------------------------------------------------------
 # In-body figure generation (with character reference)
 # ---------------------------------------------------------------------------
+
+def _generate_operation(
+    user_prompt: str,
+    index: int,
+    quality: str | None = None,
+) -> GeneratedImage | None:
+    """Operation/UI walkthrough image — no character reference, realistic UI mockup."""
+    full_prompt = f"{user_prompt}\n\n{OPERATION_STYLE_SUFFIX}"
+
+    png_bytes = _call_generate(
+        prompt=full_prompt,
+        size=config.OPENAI_IMAGE_FIGURE_SIZE,
+        quality=quality or config.OPENAI_IMAGE_QUALITY,
+    )
+    if not png_bytes:
+        return None
+
+    return _wrap_png(
+        png_bytes, filename=f"article_image_{index + 1}.png", prompt=user_prompt
+    )
+
 
 def _generate_figure(
     user_prompt: str,
