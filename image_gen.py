@@ -259,7 +259,6 @@ def _call_edit(
                     prompt=prompt,
                     size=size,
                     quality=quality,
-                    input_fidelity="high",
                     n=1,
                 )
             png_bytes = _decode_first(result)
