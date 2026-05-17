@@ -34,7 +34,7 @@ WP_APP_PASSWORD = _get_secret("WP_APP_PASSWORD")
 
 # Claude Model
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-CLAUDE_MAX_TOKENS = 32000  # Total budget (thinking + output)
+CLAUDE_MAX_TOKENS = 48000  # Total budget (thinking + output)
 CLAUDE_THINKING_BUDGET = 8000  # Tokens reserved for thinking
 
 # OpenAI Image Model (gpt-image-2, released 2026-04-21)
