@@ -613,6 +613,7 @@ if _ready_to_publish:
             format_func=lambda x: "下書き" if x == "draft" else "公開",
             index=0,
             horizontal=True,
+            key="publish_status_radio",
         )
 
         if st.button("WordPressに記事を投稿", type="primary", key="btn_create_post"):
