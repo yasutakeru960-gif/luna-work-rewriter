@@ -24,8 +24,9 @@ def _get_secret(key: str) -> str | None:
 ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 
-# WordPress
-WP_URL = "https://mixpost.net"
+# WordPress — site URL can be overridden via the WP_URL secret so that
+# swapping destinations does not require a code change.
+WP_URL = _get_secret("WP_URL") or "https://reviwviw.jp"
 WP_REST_BASE = f"{WP_URL}/wp-json/wp/v2"
 WP_POSTS_ENDPOINT = f"{WP_REST_BASE}/posts"
 WP_MEDIA_ENDPOINT = f"{WP_REST_BASE}/media"
