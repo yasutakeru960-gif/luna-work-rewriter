@@ -195,8 +195,16 @@ def create_post(
     meta_description: str = "",
     featured_image_id: int | None = None,
     status: str = "draft",
+    rest_base: str = "posts",
+    taxonomy_terms: dict[str, list[int]] | None = None,
 ) -> WPPost:
-    """Create a post via the REST API."""
+    """Create a post of the given post type via the REST API.
+
+    rest_base: REST API base of the target post type (e.g. "posts" for the
+        built-in post, or "video-articles" / a CPT slug for a custom type).
+    taxonomy_terms: {taxonomy_rest_base: [term_id, ...]} mapping to set
+        custom taxonomy terms (e.g. {"video_category": [42]}).
+    """
     payload: dict = {
         "title": title,
         "content": html_content,
@@ -208,9 +216,14 @@ def create_post(
         payload["excerpt"] = meta_description
     if featured_image_id:
         payload["featured_media"] = featured_image_id
+    if taxonomy_terms:
+        for tax_rest_base, term_ids in taxonomy_terms.items():
+            if term_ids:
+                payload[tax_rest_base] = term_ids
 
+    endpoint = f"{config.WP_REST_BASE}/{rest_base}"
     resp = requests.post(
-        config.WP_POSTS_ENDPOINT,
+        endpoint,
         headers=DEFAULT_HEADERS,
         json=payload,
         auth=_auth(),
@@ -227,6 +240,116 @@ def create_post(
     edit_url = f"{config.WP_URL}/wp-admin/post.php?post={post_id}&action=edit"
 
     return WPPost(post_id=post_id, post_url=post_url, edit_url=edit_url)
+
+
+def list_post_types() -> list[dict]:
+    """List public post types registered on the site, including CPTs.
+
+    Returns each as {"slug", "name", "rest_base", "taxonomies": [slug,...]}.
+    """
+    resp = requests.get(
+        f"{config.WP_REST_BASE}/types?context=edit",
+        headers=DEFAULT_HEADERS,
+        auth=_auth(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"投稿タイプ取得失敗 ({resp.status_code}): {_short_error(resp)}"
+        )
+    types = resp.json() or {}
+    result = []
+    for slug, info in types.items():
+        if not isinstance(info, dict):
+            continue
+        rest_base = info.get("rest_base")
+        if not rest_base:
+            continue
+        # Skip internal types like attachment / nav-menu-item / wp_block
+        if slug in ("attachment", "nav_menu_item", "wp_block",
+                    "wp_template", "wp_template_part", "wp_navigation"):
+            continue
+        result.append({
+            "slug": slug,
+            "name": info.get("name") or slug,
+            "rest_base": rest_base,
+            "taxonomies": info.get("taxonomies") or [],
+        })
+    return result
+
+
+def list_taxonomies(post_type_slug: str | None = None) -> list[dict]:
+    """List taxonomies, optionally filtered by post type slug.
+
+    Returns each as {"slug", "name", "rest_base", "types": [slug,...]}.
+    """
+    params = {"context": "edit"}
+    if post_type_slug:
+        params["type"] = post_type_slug
+    resp = requests.get(
+        f"{config.WP_REST_BASE}/taxonomies",
+        headers=DEFAULT_HEADERS,
+        auth=_auth(),
+        params=params,
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"タクソノミー取得失敗 ({resp.status_code}): {_short_error(resp)}"
+        )
+    taxes = resp.json() or {}
+    result = []
+    for slug, info in taxes.items():
+        if not isinstance(info, dict):
+            continue
+        rest_base = info.get("rest_base")
+        if not rest_base:
+            continue
+        result.append({
+            "slug": slug,
+            "name": info.get("name") or slug,
+            "rest_base": rest_base,
+            "types": info.get("types") or [],
+        })
+    return result
+
+
+def list_terms(taxonomy_rest_base: str, per_page: int = 100) -> list[dict]:
+    """List all terms of a taxonomy. Paginates through every page.
+
+    Returns each as {"id", "name", "slug", "parent"}.
+    """
+    all_terms: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"{config.WP_REST_BASE}/{taxonomy_rest_base}",
+            headers=DEFAULT_HEADERS,
+            auth=_auth(),
+            params={"per_page": per_page, "page": page, "context": "edit"},
+            timeout=15,
+        )
+        if resp.status_code == 400:
+            # past the last page
+            break
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"ターム取得失敗 ({resp.status_code}): {_short_error(resp)}"
+            )
+        terms = resp.json() or []
+        if not terms:
+            break
+        for t in terms:
+            all_terms.append({
+                "id": int(t["id"]),
+                "name": t.get("name") or "",
+                "slug": t.get("slug") or "",
+                "parent": int(t.get("parent") or 0),
+            })
+        if len(terms) < per_page:
+            break
+        page += 1
+    return all_terms
 
 
 def insert_images_into_html(

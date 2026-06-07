@@ -22,7 +22,25 @@ from wordpress import (
     upload_image,
     create_post,
     insert_images_into_html,
+    list_post_types,
+    list_taxonomies,
+    list_terms,
 )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_post_types():
+    return list_post_types()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_taxonomies(post_type_slug: str):
+    return list_taxonomies(post_type_slug)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_terms(taxonomy_rest_base: str):
+    return list_terms(taxonomy_rest_base)
 
 
 def _serialize_image(img: GeneratedImage | None) -> dict | None:
@@ -607,6 +625,69 @@ if _ready_to_publish:
         st.subheader("Phase 2: 記事を投稿")
         st.success(f"全{total_pub}枚アップロード済み — このまま投稿できます")
 
+        # --- Post type selector ---
+        try:
+            available_types = _cached_post_types()
+        except Exception as e:
+            st.error(f"投稿タイプ取得失敗: {e}")
+            available_types = [
+                {"slug": "post", "name": "投稿", "rest_base": "posts", "taxonomies": []}
+            ]
+
+        # Prefer "post" as the default unless we restored a previous choice
+        type_labels = {t["slug"]: f'{t["name"]} ({t["slug"]})' for t in available_types}
+        default_slug = st.session_state.get("publish_post_type_slug") or "post"
+        if default_slug not in type_labels:
+            default_slug = available_types[0]["slug"] if available_types else "post"
+
+        chosen_slug = st.selectbox(
+            "投稿タイプ",
+            options=list(type_labels.keys()),
+            format_func=lambda s: type_labels[s],
+            index=list(type_labels.keys()).index(default_slug),
+            key="publish_post_type_select",
+            help="記事を投稿する WordPress の投稿タイプを選びます。カスタム投稿タイプ(例: 動画記事)もここに出てきます。",
+        )
+        st.session_state.publish_post_type_slug = chosen_slug
+        chosen_type = next((t for t in available_types if t["slug"] == chosen_slug), None)
+        rest_base = chosen_type["rest_base"] if chosen_type else "posts"
+
+        # --- Taxonomy term selectors (if any are attached to this post type) ---
+        selected_terms: dict[str, list[int]] = {}
+        try:
+            taxes = _cached_taxonomies(chosen_slug)
+        except Exception as e:
+            st.warning(f"タクソノミー取得失敗: {e}")
+            taxes = []
+
+        if taxes:
+            st.markdown("**カテゴリー / タクソノミー**")
+            for tax in taxes:
+                try:
+                    terms = _cached_terms(tax["rest_base"])
+                except Exception as e:
+                    st.warning(f"{tax['name']} のターム取得失敗: {e}")
+                    continue
+                if not terms:
+                    continue
+                term_label_by_id = {t["id"]: t["name"] for t in terms}
+                # Persist per-(post_type, taxonomy) selection so switching back/forth keeps it
+                state_key = f"sel_terms__{chosen_slug}__{tax['rest_base']}"
+                default_term_ids = st.session_state.get(state_key, [])
+                # Filter defaults to currently-available terms
+                default_term_ids = [
+                    tid for tid in default_term_ids if tid in term_label_by_id
+                ]
+                picked = st.multiselect(
+                    f"{tax['name']}",
+                    options=list(term_label_by_id.keys()),
+                    format_func=lambda tid: term_label_by_id[tid],
+                    default=default_term_ids,
+                    key=state_key,
+                )
+                if picked:
+                    selected_terms[tax["rest_base"]] = picked
+
         publish_status = st.radio(
             "投稿ステータス",
             ["draft", "publish"],
@@ -634,6 +715,8 @@ if _ready_to_publish:
                     meta_description=rewritten_obj.meta_description,
                     featured_image_id=media_items[0].media_id if media_items else None,
                     status=publish_status,
+                    rest_base=rest_base,
+                    taxonomy_terms=selected_terms or None,
                 )
 
                 progress.progress(1.0, text="完了!")
