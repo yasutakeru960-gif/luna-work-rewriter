@@ -28,18 +28,20 @@ from wordpress import (
 )
 
 
+# Cache keys include the active site id so switching sites invalidates the
+# previous site's discovery data (post types, taxonomies, terms) immediately.
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_post_types():
+def _cached_post_types(site_id: str):
     return list_post_types()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_taxonomies(post_type_slug: str):
+def _cached_taxonomies(site_id: str, post_type_slug: str):
     return list_taxonomies(post_type_slug)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_terms(taxonomy_rest_base: str):
+def _cached_terms(site_id: str, taxonomy_rest_base: str):
     return list_terms(taxonomy_rest_base)
 
 
@@ -111,11 +113,40 @@ st.caption("記事URLを入力 → リライト → 画像生成 → WordPress�
 # --- Sidebar: Configuration ---
 with st.sidebar:
     st.header("設定状況")
+
+    # --- Active WordPress site selector (must run before validate_config
+    # so the right site's credentials are validated) ---
+    available_sites = config.list_wp_sites()
+    if "wp_site_id" not in st.session_state:
+        st.session_state.wp_site_id = available_sites[0]["id"]
+
+    site_label_by_id = {s["id"]: f'{s["label"]} — {s["url"]}' for s in available_sites}
+    current_idx = next(
+        (i for i, s in enumerate(available_sites) if s["id"] == st.session_state.wp_site_id),
+        0,
+    )
+    selected_site_id = st.selectbox(
+        "投稿先サイト",
+        options=[s["id"] for s in available_sites],
+        format_func=lambda sid: site_label_by_id.get(sid, sid),
+        index=current_idx,
+        key="wp_site_select",
+        help="切替えると以降のアップロード/投稿が選択サイトに対して行われます。",
+    )
+    # On switch, invalidate site-specific session state so we don't reuse
+    # media_id values uploaded to a different WP site.
+    if selected_site_id != st.session_state.wp_site_id:
+        st.session_state.wp_site_id = selected_site_id
+        if isinstance(st.session_state.get("media_items"), list):
+            st.session_state.media_items = [None] * len(st.session_state.media_items)
+        st.session_state.wp_post = None
+        st.rerun()
+
     errors = config.validate_config()
     if errors:
         for err in errors:
             st.error(err)
-        st.info("`.env` ファイルにAPIキーを設定してください")
+        st.info("`.env` または Streamlit Cloud Secrets に必要なキーを設定してください")
         st.stop()
     else:
         st.success("APIキー設定済み")
@@ -625,9 +656,10 @@ if _ready_to_publish:
         st.subheader("Phase 2: 記事を投稿")
         st.success(f"全{total_pub}枚アップロード済み — このまま投稿できます")
 
-        # --- Post type selector ---
+        # --- Post type selector (keyed by active site) ---
+        active_site_id = st.session_state.get("wp_site_id", "reviwviw")
         try:
-            available_types = _cached_post_types()
+            available_types = _cached_post_types(active_site_id)
         except Exception as e:
             st.error(f"投稿タイプ取得失敗: {e}")
             available_types = [
@@ -655,7 +687,7 @@ if _ready_to_publish:
         # --- Taxonomy term selectors (if any are attached to this post type) ---
         selected_terms: dict[str, list[int]] = {}
         try:
-            taxes = _cached_taxonomies(chosen_slug)
+            taxes = _cached_taxonomies(active_site_id, chosen_slug)
         except Exception as e:
             st.warning(f"タクソノミー取得失敗: {e}")
             taxes = []
@@ -664,7 +696,7 @@ if _ready_to_publish:
             st.markdown("**カテゴリー / タクソノミー**")
             for tax in taxes:
                 try:
-                    terms = _cached_terms(tax["rest_base"])
+                    terms = _cached_terms(active_site_id, tax["rest_base"])
                 except Exception as e:
                     st.warning(f"{tax['name']} のターム取得失敗: {e}")
                     continue
