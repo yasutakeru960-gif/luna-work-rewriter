@@ -1,18 +1,23 @@
+import base64
 import dataclasses
 import json
+from io import BytesIO
 
 import streamlit as st
+from PIL import Image
 
 import config
 from scraper import scrape_article, create_article_from_text, ScrapedArticle
 from rewriter import rewrite_article, RewrittenArticle
 from image_gen import (
+    GeneratedImage,
     generate_article_images_parallel,
     generate_one_image,
     regenerate_character_reference,
     save_uploaded_character_reference,
 )
 from wordpress import (
+    WPMediaItem,
     test_connection,
     upload_image,
     create_post,
@@ -20,12 +25,57 @@ from wordpress import (
 )
 
 
+def _serialize_image(img: GeneratedImage | None) -> dict | None:
+    if img is None:
+        return None
+    return {
+        "image_bytes_b64": base64.b64encode(img.image_bytes).decode("ascii"),
+        "filename": img.filename,
+        "mime_type": img.mime_type,
+        "prompt": img.prompt,
+    }
+
+
+def _deserialize_image(d: dict | None) -> GeneratedImage | None:
+    if not d:
+        return None
+    raw = base64.b64decode(d["image_bytes_b64"])
+    return GeneratedImage(
+        image_bytes=raw,
+        filename=d.get("filename", "image.png"),
+        mime_type=d.get("mime_type", "image/png"),
+        prompt=d.get("prompt", ""),
+        pil_image=Image.open(BytesIO(raw)),
+    )
+
+
+def _serialize_media(m: WPMediaItem | None) -> dict | None:
+    if m is None:
+        return None
+    return {"media_id": m.media_id, "source_url": m.source_url}
+
+
+def _deserialize_media(d: dict | None) -> WPMediaItem | None:
+    if not d:
+        return None
+    return WPMediaItem(media_id=int(d["media_id"]), source_url=d["source_url"])
+
+
 def _serialize_draft() -> str:
-    """Serialize the scraped + rewritten article to JSON for download."""
+    """Serialize scraped + rewritten + generated images + uploaded media for download.
+
+    The image bytes are base64-encoded so a single JSON file can resume any
+    point in the pipeline: re-rewrite skipped, re-generate skipped, re-upload
+    skipped for slots that already have a media id.
+    """
+    images = st.session_state.get("images") or []
+    media_items = st.session_state.get("media_items") or []
     return json.dumps(
         {
             "scraped": dataclasses.asdict(st.session_state.scraped),
             "rewritten": dataclasses.asdict(st.session_state.rewritten),
+            "images": [_serialize_image(i) for i in images],
+            "media_items": [_serialize_media(m) for m in media_items],
         },
         ensure_ascii=False,
         indent=2,
@@ -213,9 +263,21 @@ with input_tab_draft:
             data = json.loads(uploaded_draft.read().decode("utf-8"))
             st.session_state.scraped = ScrapedArticle(**data["scraped"])
             st.session_state.rewritten = RewrittenArticle(**data["rewritten"])
-            st.session_state.images = None
+
+            images_data = data.get("images") or []
+            media_data = data.get("media_items") or []
+            restored_images = [_deserialize_image(d) for d in images_data]
+            restored_media = [_deserialize_media(d) for d in media_data]
+            st.session_state.images = restored_images if restored_images else None
+            st.session_state.media_items = restored_media if restored_media else None
             st.session_state.wp_post = None
-            st.success("下書きを復元しました。Step 4以降から再開できます")
+
+            done_imgs = sum(1 for i in restored_images if i is not None)
+            done_media = sum(1 for m in restored_media if m is not None)
+            st.success(
+                f"下書きを復元しました(画像 {done_imgs}枚 / アップロード済 {done_media}枚)。"
+                " Step 4以降から再開できます"
+            )
             st.rerun()
         except Exception as e:
             st.error(f"下書きの読み込み失敗: {e}")
@@ -305,6 +367,12 @@ if st.session_state.rewritten:
         or len(st.session_state.images) != total_imgs
     ):
         st.session_state.images = [None] * total_imgs
+    # Keep media_items aligned with images length
+    if (
+        not isinstance(st.session_state.get("media_items"), list)
+        or len(st.session_state.media_items) != total_imgs
+    ):
+        st.session_state.media_items = [None] * total_imgs
 
     done_count = sum(1 for img in st.session_state.images if img is not None)
     remaining_indices = [
@@ -431,6 +499,13 @@ if st.session_state.rewritten:
                                 )
                                 if new_img is not None:
                                     st.session_state.images[i] = new_img
+                                    # Invalidate the matching uploaded media
+                                    # so the new image gets re-uploaded next time
+                                    if (
+                                        isinstance(st.session_state.get("media_items"), list)
+                                        and i < len(st.session_state.media_items)
+                                    ):
+                                        st.session_state.media_items[i] = None
                                     st.session_state.wp_post = None
                                     st.rerun()
                                 else:
@@ -459,62 +534,121 @@ if _ready_to_publish:
         horizontal=True,
     )
 
-    if st.button("WordPressにアップロード & 投稿", type="primary"):
-        progress = st.progress(0, text="準備中...")
-        try:
-            # 1. Upload images
-            media_items = []
-            total_steps = len(st.session_state.images) + 2
-            for i, img in enumerate(st.session_state.images):
-                progress.progress(
-                    (i + 1) / total_steps,
-                    text=f"画像 {i + 1}/{len(st.session_state.images)} をアップロード中...",
+    images_list = st.session_state.images
+    total_pub = len(images_list)
+
+    # Keep media_items aligned with images
+    if (
+        not isinstance(st.session_state.get("media_items"), list)
+        or len(st.session_state.media_items) != total_pub
+    ):
+        st.session_state.media_items = [None] * total_pub
+
+    uploaded_count = sum(1 for m in st.session_state.media_items if m is not None)
+    pending_uploads = [
+        i for i, m in enumerate(st.session_state.media_items) if m is None
+    ]
+
+    # Phase 1: incremental image upload
+    if pending_uploads:
+        st.subheader("Phase 1: 画像をWordPressにアップロード")
+        if uploaded_count > 0:
+            st.info(
+                f"アップロード済 {uploaded_count}/{total_pub} 枚。"
+                f" 残り{len(pending_uploads)}枚を続けてアップロードします。"
+            )
+        if st.button(
+            f"画像をアップロード ({len(pending_uploads)}枚)",
+            type="primary",
+            key="btn_upload_imgs",
+        ):
+            progress = st.progress(
+                uploaded_count / total_pub if total_pub else 0.0,
+                text=f"アップロード中... 完了 {uploaded_count}/{total_pub}",
+            )
+            failed_at: int | None = None
+            failure_msg = ""
+            for idx in pending_uploads:
+                img = images_list[idx]
+                try:
+                    media = upload_image(
+                        image_bytes=img.image_bytes,
+                        filename=img.filename,
+                        mime_type=img.mime_type,
+                        alt_text=img.prompt,
+                    )
+                    st.session_state.media_items[idx] = media
+                    uploaded_count += 1
+                    progress.progress(
+                        uploaded_count / total_pub,
+                        text=f"アップロード中... 完了 {uploaded_count}/{total_pub}",
+                    )
+                except Exception as e:
+                    failed_at = idx
+                    failure_msg = str(e)
+                    break
+
+            if failed_at is None:
+                st.success(f"{total_pub}枚すべてアップロード完了")
+            else:
+                st.error(
+                    f"画像 {failed_at + 1} のアップロードで失敗: {failure_msg}。"
+                    " アップロード済の{uploaded_count}枚はsession_stateに保存されているので、"
+                    " ボタンをもう一度押せば残り{total_pub - uploaded_count}枚から再開できます。"
                 )
-                media = upload_image(
-                    image_bytes=img.image_bytes,
-                    filename=img.filename,
-                    mime_type=img.mime_type,
-                    alt_text=img.prompt,
+            st.rerun()
+        st.caption(
+            "※ 失敗してもアップロード済みの画像は保持されます。下書きJSONをダウンロードしておくと"
+            "セッション/再デプロイをまたいでも再開できます。"
+        )
+
+    # Phase 2: create the post once all images are uploaded
+    else:
+        st.subheader("Phase 2: 記事を投稿")
+        st.success(f"全{total_pub}枚アップロード済み — このまま投稿できます")
+
+        publish_status = st.radio(
+            "投稿ステータス",
+            ["draft", "publish"],
+            format_func=lambda x: "下書き" if x == "draft" else "公開",
+            index=0,
+            horizontal=True,
+        )
+
+        if st.button("WordPressに記事を投稿", type="primary", key="btn_create_post"):
+            progress = st.progress(0.0, text="HTMLに画像を挿入中...")
+            try:
+                media_items = st.session_state.media_items
+                final_html = insert_images_into_html(
+                    st.session_state.rewritten.html_content,
+                    media_items,
                 )
-                media_items.append(media)
+                progress.progress(0.5, text="記事を投稿中...")
 
-            # 2. Insert images into HTML
-            progress.progress(
-                (len(st.session_state.images) + 1) / total_steps,
-                text="HTMLに画像を挿入中...",
-            )
-            final_html = insert_images_into_html(
-                st.session_state.rewritten.html_content,
-                media_items,
-            )
+                rewritten_obj = st.session_state.rewritten
+                wp_post = create_post(
+                    title=rewritten_obj.title,
+                    html_content=final_html,
+                    slug=rewritten_obj.slug,
+                    meta_description=rewritten_obj.meta_description,
+                    featured_image_id=media_items[0].media_id if media_items else None,
+                    status=publish_status,
+                )
 
-            # 3. Create post
-            progress.progress(
-                (total_steps - 1) / total_steps,
-                text="記事を投稿中...",
-            )
-            rewritten = st.session_state.rewritten
-            wp_post = create_post(
-                title=rewritten.title,
-                html_content=final_html,
-                slug=rewritten.slug,
-                meta_description=rewritten.meta_description,
-                featured_image_id=media_items[0].media_id if media_items else None,
-                status=publish_status,
-            )
+                progress.progress(1.0, text="完了!")
+                st.session_state.wp_post = wp_post
 
-            progress.progress(1.0, text="完了!")
-            st.session_state.wp_post = wp_post
-
-            st.success("投稿が完了しました!")
-            st.markdown(f"**記事を見る**: [{wp_post.post_url}]({wp_post.post_url})")
-            st.markdown(
-                f"**管理画面で編集**: [{wp_post.edit_url}]({wp_post.edit_url})"
-            )
-
-        except Exception as e:
-            progress.empty()
-            st.error(f"投稿失敗: {e}")
+                st.success("投稿が完了しました!")
+                st.markdown(f"**記事を見る**: [{wp_post.post_url}]({wp_post.post_url})")
+                st.markdown(
+                    f"**管理画面で編集**: [{wp_post.edit_url}]({wp_post.edit_url})"
+                )
+            except Exception as e:
+                progress.empty()
+                st.error(
+                    f"投稿失敗: {e}。画像はWPにアップロード済なので、"
+                    "もう一度このボタンを押すと再試行できます(画像の再アップロードは発生しません)。"
+                )
 
 # Show result if already posted
 elif st.session_state.wp_post:
