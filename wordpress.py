@@ -85,46 +85,61 @@ def test_connection() -> tuple[bool, str]:
         if r1.status_code != 200:
             return False, f"REST 探索失敗 ({r1.status_code}): {_short_error(r1)}"
 
-        # 2) Does the Application Password let us read posts?
+        # 2) Authenticated GET /users/me?context=edit — this strictly requires
+        #    a valid WP_USERNAME + WP_APP_PASSWORD pair AND returns the user's
+        #    role + capabilities so we can verify they can actually publish.
         r2 = requests.get(
-            f"{config.WP_POSTS_ENDPOINT}?per_page=1",
+            f"{config.WP_REST_BASE}/users/me?context=edit",
             headers=DEFAULT_HEADERS,
             auth=_auth(),
             timeout=15,
         )
         if r2.status_code == 401:
             return False, (
-                "認証エラー (401): WP_USERNAME / WP_APP_PASSWORD を確認してください。"
-                "アプリケーションパスワードは『スペース込み24文字』をそのままコピーします。"
-                "ユーザー名は表示名ではなくログイン用のユーザー名(ID)です。"
+                "認証エラー (401): WP_USERNAME / WP_APP_PASSWORD のどちらかが間違っています。"
+                " 確認ポイント: (1) Application Passwordを発行した本人のログインID(表示名/メアドではなく)を WP_USERNAME に入れる。"
+                " (2) アプリケーションパスワードはスペース込み24文字を改行なしでそのままコピー。"
+                " (3) Secretsを保存してアプリを再起動済みか。"
             )
         if r2.status_code == 403:
             return False, (
-                f"投稿API への認証アクセスがブロックされました (403): {_short_error(r2)}"
-                " Application Passwords 機能が有効か、ユーザーに編集権限(投稿者以上)"
-                "があるか、セキュリティプラグインがREST APIを制限していないか確認してください。"
+                f"権限エラー (403): {_short_error(r2)} "
+                "認証は通ったが /users/me が拒否されました。ConoHa等のサーバー側設定で "
+                "/wp-json/wp/v2/users/* が遮断されている可能性。"
             )
         if r2.status_code != 200:
-            return False, f"投稿API アクセス失敗 ({r2.status_code}): {_short_error(r2)}"
+            return False, f"users/me 失敗 ({r2.status_code}): {_short_error(r2)}"
 
-        # 3) Try to fetch the friendly display name (non-fatal if blocked)
-        display_name = None
-        try:
-            r3 = requests.get(
-                f"{config.WP_REST_BASE}/users/me",
-                headers=DEFAULT_HEADERS,
-                auth=_auth(),
-                timeout=15,
+        data = r2.json()
+        display_name = data.get("name") or data.get("slug") or "?"
+        username = data.get("username") or data.get("slug") or "?"
+        roles = data.get("roles", [])
+        caps = data.get("capabilities", {}) or {}
+        can_upload = bool(caps.get("upload_files"))
+        can_publish = bool(caps.get("publish_posts"))
+        can_edit = bool(caps.get("edit_posts"))
+
+        # If the user authenticates but lacks the WP capabilities we need,
+        # warn loudly — the publish step will otherwise fail with the same
+        # opaque "このユーザーとして投稿を編集する権限がありません" 401.
+        if not (can_upload and can_publish and can_edit):
+            missing = []
+            if not can_edit:
+                missing.append("edit_posts")
+            if not can_publish:
+                missing.append("publish_posts")
+            if not can_upload:
+                missing.append("upload_files")
+            return False, (
+                f"認証はOK(ユーザー: {display_name} / login: {username} / 権限グループ: {roles})ですが、"
+                f"必要な能力が不足しています: {', '.join(missing)}。"
+                f" wp-admin → ユーザー → 当該ユーザー → 権限グループを「編集者」または「管理者」に変更してください。"
             )
-            if r3.status_code == 200:
-                data = r3.json()
-                display_name = data.get("name") or data.get("slug")
-        except requests.exceptions.RequestException:
-            pass
 
-        if display_name:
-            return True, f"接続成功 (ユーザー: {display_name} @ {config.WP_URL})"
-        return True, f"接続成功 (REST API + 認証OK @ {config.WP_URL})"
+        return True, (
+            f"接続成功 (ユーザー: {display_name} / login: {username} / "
+            f"権限グループ: {roles[0] if roles else '?'} @ {config.WP_URL})"
+        )
     except requests.exceptions.RequestException as e:
         return False, f"接続エラー: {e}"
 
