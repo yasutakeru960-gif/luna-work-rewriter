@@ -26,6 +26,18 @@ def _auth() -> HTTPBasicAuth:
     return HTTPBasicAuth(config.WP_USERNAME or "", config.WP_APP_PASSWORD or "")
 
 
+# Browser-like User-Agent. Many Japanese rental hosts (XServer, Lolipop,
+# SAKURA) block the default "python-requests/2.x" UA at the WAF layer.
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36 LunaWorkRewriter/1.0"
+    ),
+    "Accept": "application/json",
+}
+
+
 def _short_error(resp: requests.Response) -> str:
     """Best-effort extraction of a human-friendly WP REST error message."""
     try:
@@ -40,35 +52,79 @@ def _short_error(resp: requests.Response) -> str:
 def test_connection() -> tuple[bool, str]:
     """Test REST API connectivity + Application Password auth.
 
-    Hits /wp-json/wp/v2/users/me which requires authentication, so a 200
-    confirms both that the REST API is reachable and that the credentials
-    are valid.
+    Runs three probes in order so failure messages point at the real cause:
+      1. anonymous GET /wp-json/ — proves the REST API itself is reachable
+         (catches host-level WAF / .htaccess blocks before we even try auth)
+      2. authenticated GET /wp-json/wp/v2/posts?per_page=1 — verifies the
+         Application Password works. /posts is rarely blocked, whereas
+         /users/me is commonly blocked at the host firewall on Japanese
+         shared hosts to prevent username enumeration
+      3. authenticated GET /wp-json/wp/v2/users/me — best-effort fetch of
+         the friendly display name; failure here is non-fatal
     """
     try:
-        resp = requests.get(
-            f"{config.WP_REST_BASE}/users/me",
+        # 1) Is REST API reachable at all?
+        r1 = requests.get(
+            f"{config.WP_URL}/wp-json/",
+            headers=DEFAULT_HEADERS,
+            timeout=15,
+        )
+        if r1.status_code == 403:
+            return False, (
+                "REST API がサーバーレベルでブロックされています (403)。"
+                "レンタルサーバーのWAF設定、または .htaccess で /wp-json/ "
+                "がブロックされていないか確認してください。"
+                f" サーバー応答先頭: {_short_error(r1)}"
+            )
+        if r1.status_code == 404:
+            return False, (
+                "REST API が見つかりません (404)。WordPress 管理画面の "
+                "「設定 → パーマリンク」で「投稿名」などを選択して保存し、"
+                "REST APIを無効化するプラグインが入っていないか確認してください。"
+            )
+        if r1.status_code != 200:
+            return False, f"REST 探索失敗 ({r1.status_code}): {_short_error(r1)}"
+
+        # 2) Does the Application Password let us read posts?
+        r2 = requests.get(
+            f"{config.WP_POSTS_ENDPOINT}?per_page=1",
+            headers=DEFAULT_HEADERS,
             auth=_auth(),
             timeout=15,
         )
-        if resp.status_code == 200:
-            data = resp.json()
-            name = data.get("name") or data.get("slug") or "unknown"
-            return True, f"接続成功 (ユーザー: {name} @ {config.WP_URL})"
-        if resp.status_code == 401:
-            return (
-                False,
+        if r2.status_code == 401:
+            return False, (
                 "認証エラー (401): WP_USERNAME / WP_APP_PASSWORD を確認してください。"
-                " アプリケーションパスワードはスペース込み24文字でコピーします。",
+                "アプリケーションパスワードは『スペース込み24文字』をそのままコピーします。"
+                "ユーザー名は表示名ではなくログイン用のユーザー名(ID)です。"
             )
-        if resp.status_code == 403:
-            return False, f"権限エラー (403): {_short_error(resp)}"
-        if resp.status_code == 404:
-            return (
-                False,
-                f"REST API が見つかりません (404): {config.WP_URL}/wp-json/ "
-                "は有効ですか？ パーマリンク設定や REST 無効化プラグインを確認してください。",
+        if r2.status_code == 403:
+            return False, (
+                f"投稿API への認証アクセスがブロックされました (403): {_short_error(r2)}"
+                " Application Passwords 機能が有効か、ユーザーに編集権限(投稿者以上)"
+                "があるか、セキュリティプラグインがREST APIを制限していないか確認してください。"
             )
-        return False, f"接続エラー ({resp.status_code}): {_short_error(resp)}"
+        if r2.status_code != 200:
+            return False, f"投稿API アクセス失敗 ({r2.status_code}): {_short_error(r2)}"
+
+        # 3) Try to fetch the friendly display name (non-fatal if blocked)
+        display_name = None
+        try:
+            r3 = requests.get(
+                f"{config.WP_REST_BASE}/users/me",
+                headers=DEFAULT_HEADERS,
+                auth=_auth(),
+                timeout=15,
+            )
+            if r3.status_code == 200:
+                data = r3.json()
+                display_name = data.get("name") or data.get("slug")
+        except requests.exceptions.RequestException:
+            pass
+
+        if display_name:
+            return True, f"接続成功 (ユーザー: {display_name} @ {config.WP_URL})"
+        return True, f"接続成功 (REST API + 認証OK @ {config.WP_URL})"
     except requests.exceptions.RequestException as e:
         return False, f"接続エラー: {e}"
 
@@ -81,6 +137,7 @@ def upload_image(
 ) -> WPMediaItem:
     """Upload an image to the WordPress media library via the REST API."""
     headers = {
+        **DEFAULT_HEADERS,
         "Content-Disposition": f'attachment; filename="{filename}"',
         "Content-Type": mime_type,
     }
@@ -105,6 +162,7 @@ def upload_image(
         try:
             requests.post(
                 f"{config.WP_MEDIA_ENDPOINT}/{media_id}",
+                headers=DEFAULT_HEADERS,
                 json={"alt_text": alt_text},
                 auth=_auth(),
                 timeout=15,
@@ -138,6 +196,7 @@ def create_post(
 
     resp = requests.post(
         config.WP_POSTS_ENDPOINT,
+        headers=DEFAULT_HEADERS,
         json=payload,
         auth=_auth(),
         timeout=60,
