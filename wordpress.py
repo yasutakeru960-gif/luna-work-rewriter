@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import base64
-import xmlrpc.client
 from dataclasses import dataclass
+
+import requests
+from requests.auth import HTTPBasicAuth
 
 import config
 
@@ -20,26 +21,55 @@ class WPPost:
     edit_url: str
 
 
-def _get_xmlrpc_client() -> xmlrpc.client.ServerProxy:
-    """Get XML-RPC client for WordPress."""
-    return xmlrpc.client.ServerProxy(f"{config.WP_URL}/xmlrpc.php")
+def _auth() -> HTTPBasicAuth:
+    """Application Password = HTTP Basic Auth on the WP REST API."""
+    return HTTPBasicAuth(config.WP_USERNAME or "", config.WP_APP_PASSWORD or "")
+
+
+def _short_error(resp: requests.Response) -> str:
+    """Best-effort extraction of a human-friendly WP REST error message."""
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            return data.get("message") or str(data)[:300]
+    except Exception:
+        pass
+    return (resp.text or "")[:300]
 
 
 def test_connection() -> tuple[bool, str]:
-    """Test WordPress XML-RPC connectivity and authentication."""
+    """Test REST API connectivity + Application Password auth.
+
+    Hits /wp-json/wp/v2/users/me which requires authentication, so a 200
+    confirms both that the REST API is reachable and that the credentials
+    are valid.
+    """
     try:
-        client = _get_xmlrpc_client()
-        blogs = client.wp.getUsersBlogs(
-            config.WP_USERNAME,
-            config.WP_APP_PASSWORD,
+        resp = requests.get(
+            f"{config.WP_REST_BASE}/users/me",
+            auth=_auth(),
+            timeout=15,
         )
-        if blogs:
-            blog_name = blogs[0].get("blogName", "unknown")
-            return True, f"接続成功 (サイト: {blog_name})"
-        return False, "ブログ情報を取得できませんでした"
-    except xmlrpc.client.Fault as e:
-        return False, f"認証エラー: {e.faultString}"
-    except Exception as e:
+        if resp.status_code == 200:
+            data = resp.json()
+            name = data.get("name") or data.get("slug") or "unknown"
+            return True, f"接続成功 (ユーザー: {name} @ {config.WP_URL})"
+        if resp.status_code == 401:
+            return (
+                False,
+                "認証エラー (401): WP_USERNAME / WP_APP_PASSWORD を確認してください。"
+                " アプリケーションパスワードはスペース込み24文字でコピーします。",
+            )
+        if resp.status_code == 403:
+            return False, f"権限エラー (403): {_short_error(resp)}"
+        if resp.status_code == 404:
+            return (
+                False,
+                f"REST API が見つかりません (404): {config.WP_URL}/wp-json/ "
+                "は有効ですか？ パーマリンク設定や REST 無効化プラグインを確認してください。",
+            )
+        return False, f"接続エラー ({resp.status_code}): {_short_error(resp)}"
+    except requests.exceptions.RequestException as e:
         return False, f"接続エラー: {e}"
 
 
@@ -49,27 +79,40 @@ def upload_image(
     mime_type: str = "image/png",
     alt_text: str = "",
 ) -> WPMediaItem:
-    """Upload an image to WordPress media library via XML-RPC."""
-    client = _get_xmlrpc_client()
-
-    media_data = {
-        "name": filename,
-        "type": mime_type,
-        "bits": xmlrpc.client.Binary(image_bytes),
-        "overwrite": False,
+    """Upload an image to the WordPress media library via the REST API."""
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": mime_type,
     }
-
-    result = client.wp.uploadFile(
-        1,  # blog_id
-        config.WP_USERNAME,
-        config.WP_APP_PASSWORD,
-        media_data,
+    resp = requests.post(
+        config.WP_MEDIA_ENDPOINT,
+        headers=headers,
+        data=image_bytes,
+        auth=_auth(),
+        timeout=120,
     )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"画像アップロード失敗 ({resp.status_code}): {_short_error(resp)}"
+        )
 
-    return WPMediaItem(
-        media_id=int(result["id"]),
-        source_url=result["url"],
-    )
+    data = resp.json()
+    media_id = int(data["id"])
+    source_url = data.get("source_url") or data.get("guid", {}).get("rendered", "")
+
+    # Best-effort alt text (separate PATCH so a failure here doesn't kill upload)
+    if alt_text:
+        try:
+            requests.post(
+                f"{config.WP_MEDIA_ENDPOINT}/{media_id}",
+                json={"alt_text": alt_text},
+                auth=_auth(),
+                timeout=15,
+            )
+        except requests.exceptions.RequestException:
+            pass
+
+    return WPMediaItem(media_id=media_id, source_url=source_url)
 
 
 def create_post(
@@ -80,53 +123,43 @@ def create_post(
     featured_image_id: int | None = None,
     status: str = "draft",
 ) -> WPPost:
-    """Create a WordPress post via XML-RPC."""
-    client = _get_xmlrpc_client()
-
-    post_data: dict = {
-        "post_type": "post",
-        "post_title": title,
-        "post_content": html_content,
-        "post_status": status,
+    """Create a post via the REST API."""
+    payload: dict = {
+        "title": title,
+        "content": html_content,
+        "status": status,
     }
     if slug:
-        post_data["post_name"] = slug
+        payload["slug"] = slug
     if meta_description:
-        post_data["post_excerpt"] = meta_description
+        payload["excerpt"] = meta_description
     if featured_image_id:
-        post_data["post_thumbnail"] = featured_image_id
+        payload["featured_media"] = featured_image_id
 
-    post_id = client.wp.newPost(
-        1,  # blog_id
-        config.WP_USERNAME,
-        config.WP_APP_PASSWORD,
-        post_data,
+    resp = requests.post(
+        config.WP_POSTS_ENDPOINT,
+        json=payload,
+        auth=_auth(),
+        timeout=60,
     )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"投稿作成失敗 ({resp.status_code}): {_short_error(resp)}"
+        )
 
-    post_id = int(post_id)
+    data = resp.json()
+    post_id = int(data["id"])
+    post_url = data.get("link") or f"{config.WP_URL}/?p={post_id}"
+    edit_url = f"{config.WP_URL}/wp-admin/post.php?post={post_id}&action=edit"
 
-    # Get the post URL
-    post_info = client.wp.getPost(
-        1,
-        config.WP_USERNAME,
-        config.WP_APP_PASSWORD,
-        post_id,
-        ["link"],
-    )
-    post_url = post_info.get("link", f"{config.WP_URL}/?p={post_id}")
-
-    return WPPost(
-        post_id=post_id,
-        post_url=post_url,
-        edit_url=f"{config.WP_URL}/wp-admin/post.php?post={post_id}&action=edit",
-    )
+    return WPPost(post_id=post_id, post_url=post_url, edit_url=edit_url)
 
 
 def insert_images_into_html(
     html_content: str,
     media_items: list[WPMediaItem],
 ) -> str:
-    """Replace IMAGE_PLACEHOLDER comments with actual WordPress image tags."""
+    """Replace IMAGE_PLACEHOLDER_N comments with actual WordPress image tags."""
     for i, media in enumerate(media_items):
         placeholder = f"<!-- IMAGE_PLACEHOLDER_{i + 1} -->"
         img_tag = (
