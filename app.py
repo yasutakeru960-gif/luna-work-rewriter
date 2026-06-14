@@ -472,7 +472,12 @@ if st.session_state.rewritten:
         # Frozen / slotted dataclass — fine, we still have styles_list below
         pass
 
-    _style_label = {"hero": "サムネ", "figure": "図解", "operation": "操作画面"}
+    _style_label = {
+        "hero": "サムネ",
+        "figure": "図解",
+        "accent": "シンプル絵",
+        "operation": "操作画面",
+    }
 
     with st.expander("生成プロンプト一覧", expanded=False):
         for i, prompt in enumerate(rewritten.image_prompts):

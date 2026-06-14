@@ -138,6 +138,42 @@ OPERATION_STYLE_SUFFIX = (
 )
 
 
+ACCENT_STYLE_SUFFIX = (
+    "Render this as a SIMPLE, calm accent illustration — a magazine-column "
+    "spot illustration whose only job is to give the reader's eye a rest "
+    "between paragraphs of text. NOT an explainer diagram. "
+    "\n\n"
+    "==== CRITICAL — what this is NOT: ==== "
+    "NOT a multi-panel explainer. NOT a diagram. NOT a chart. "
+    "NO speech bubbles. NO Japanese onomatopoeia (no プルプル / ガーン / etc). "
+    "NO labels, NO arrows, NO step markers, NO UI mockups (no laptops, no "
+    "file icons, no chat windows). NO captions inside the image. "
+    "Minimize text — ideally zero text. If text is unavoidable, at most one "
+    "short hand-lettered word as a soft accent. "
+    "\n\n"
+    "==== CRITICAL — what this IS: ==== "
+    "The SAME woman from the reference image, drawn as a single character "
+    "or a single small scene with her in one natural pose that fits the "
+    "section's mood (relaxed, thinking, smiling, sipping coffee, sitting at "
+    "a window, stretching, holding a notebook, looking up at a sky, etc.). "
+    "Hand-drawn cartoon-manga style consistent with the rest of the article: "
+    "bold thick black ink outlines, simple flat color fills, no gradients, "
+    "small blush dots on cheeks, expressive but subtle face. "
+    "Plain white or very light single-tone pastel background. "
+    "\n\n"
+    "==== Character continuity: ==== "
+    "Keep her hair (shoulder-length wavy brown with soft bangs), her outfit "
+    "(bright mustard-yellow t-shirt + blue denim shorts), face, and body "
+    "proportions IDENTICAL to the reference. "
+    "\n\n"
+    "==== Composition: ==== "
+    "Centered or slightly off-center single subject. Lots of negative space. "
+    "Phone-friendly, easy on the eyes. "
+    "Overall feel: a quiet, friendly spot illustration in a Japanese "
+    "lifestyle column — adds visual rhythm without adding information."
+)
+
+
 FIGURE_STYLE_SUFFIX = (
     "Render this as a hand-drawn cartoon-manga illustration in the style of a Japanese "
     "essay comic / weekly ladies' magazine column cut illustration "
@@ -201,7 +237,7 @@ def _resolve_style(
 ) -> str:
     if image_styles and 0 <= index < len(image_styles):
         s = (image_styles[index] or "").lower().strip()
-        if s in ("hero", "figure", "operation"):
+        if s in ("hero", "figure", "accent", "operation"):
             return s
     return default
 
@@ -235,6 +271,10 @@ def generate_one_image(
     if style == "operation":
         return _generate_operation(prompt, index=index, quality=effective_quality)
     reference_path = _ensure_character_reference()
+    if style == "accent":
+        return _generate_accent(
+            prompt, reference_path, index=index, quality=effective_quality
+        )
     return _generate_figure(
         prompt, reference_path, index=index, quality=effective_quality
     )
@@ -428,6 +468,29 @@ def _generate_operation(
 
     png_bytes = _call_generate(
         prompt=full_prompt,
+        size=config.OPENAI_IMAGE_FIGURE_SIZE,
+        quality=quality or config.OPENAI_IMAGE_QUALITY,
+    )
+    if not png_bytes:
+        return None
+
+    return _wrap_png(
+        png_bytes, filename=f"article_image_{index + 1}.png", prompt=user_prompt
+    )
+
+
+def _generate_accent(
+    user_prompt: str,
+    reference_path: Path,
+    index: int,
+    quality: str | None = None,
+) -> GeneratedImage | None:
+    """Accent/spot illustration — minimal text, calm single-figure scene."""
+    full_prompt = f"{user_prompt}\n\n{ACCENT_STYLE_SUFFIX}"
+
+    png_bytes = _call_edit(
+        prompt=full_prompt,
+        reference_path=reference_path,
         size=config.OPENAI_IMAGE_FIGURE_SIZE,
         quality=quality or config.OPENAI_IMAGE_QUALITY,
     )
