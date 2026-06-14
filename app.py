@@ -390,8 +390,18 @@ if st.session_state.scraped:
     # Step 3: Rewrite
     # ========================================
     st.header("Step 3: AIでリライト")
+    _char_count = len(article.text)
+    if _char_count > 22000:
+        _est_chunks = max((_char_count // 13000) + 1, 2)
+        st.caption(
+            f"元記事 約{_char_count:,}字 → 長いため{_est_chunks}分割でリライトします"
+            f"（ボリュームを保つため。{_est_chunks}〜{_est_chunks * 2}分ほどかかります）"
+        )
+        _spinner_msg = f"Claude APIで分割リライト中...（{_est_chunks}パート / 数分かかります）"
+    else:
+        _spinner_msg = "Claude APIでリライト中...（30〜60秒かかります）"
     if st.button("リライト実行", type="primary"):
-        with st.spinner("Claude APIでリライト中...（30〜60秒かかります）"):
+        with st.spinner(_spinner_msg):
             try:
                 st.session_state.rewritten = rewrite_article(article)
                 st.session_state.images = None

@@ -257,6 +257,27 @@ HTMLを書き終わったあと、出力する前に頭の中で以下を確認�
 - 中盤画像のプロンプトも、そのページの位置に合った具体的な内容にしてください(冒頭画像と被らないように)"""
 
 
+# Used for continuation chunks when a long article is rewritten in pieces.
+# Same persona/rules, but: no title/slug/meta, no intro greeting, no hero
+# image, no final conclusion (unless it is the last chunk).
+CONTINUATION_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+## 🔴 この呼び出しは「記事の途中部分」のリライトです(超重要)
+
+あなたは今、長い記事を分割してリライトしている **途中のパート** を担当しています。
+以下を厳守してください:
+
+- **冒頭の挨拶("こんにちは"など)は書かない**でください。記事の続きとして、いきなり本文(H2セクション)から始めてください。
+- **アイキャッチ画像( IMAGE_PLACEHOLDER_1 相当 )は配置しない**でください。このパートは本文の途中です。
+- **このパートに含まれる元記事の各H2セクションを、すべて漏れなくリライト**してください。
+- 画像プレースホルダーの番号は **このパート内で 1 から振ってOK**です(システム側で自動的に通し番号に振り直します)。
+- 各H2直後への画像配置、長いH2の中盤画像、image_style指定(figure/accent/operation)のルールは通常どおり守ってください。
+- メタデータ部分( ---METADATA--- )には **title/slug/meta_description は書かず、image_prompt_N と image_style_N だけ**書いてください。
+- まとめ・結論セクションは **このパートが記事の最後でない限り書かない**でください。淡々と本文を続けてください。
+
+出力フォーマットは通常どおり ---METADATA--- と ---HTML--- で区切ってください。"""
+
+
 @dataclass
 class RewrittenArticle:
     title: str
@@ -271,11 +292,16 @@ class RewrittenArticle:
     slug: str = ""
 
 
-def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
-    """Rewrite article using Claude API with Extended Thinking (streaming)."""
-    user_prompt = _build_user_prompt(article)
+# Articles longer than this (source chars) are rewritten in multiple chunks,
+# because a single Claude call caps at 64k output tokens — not enough to
+# rewrite a ~45k-char article at equal volume in one shot.
+SINGLE_SHOT_CHAR_LIMIT = 22000
+# Target source chars per chunk when splitting a long article.
+REWRITE_CHUNK_CHAR_LIMIT = 13000
 
-    # Use streaming to avoid timeout with Extended Thinking
+
+def _call_claude(system_prompt: str, user_prompt: str) -> str:
+    """One streaming Claude call with extended thinking. Returns text output."""
     text_parts = []
     with _get_client().messages.stream(
         model=config.CLAUDE_MODEL,
@@ -284,25 +310,31 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
             "type": "enabled",
             "budget_tokens": config.CLAUDE_THINKING_BUDGET,
         },
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
         response = stream.get_final_message()
-
-    # With extended thinking, extract only text blocks (skip thinking blocks)
     for block in response.content:
         if block.type == "text":
             text_parts.append(block.text)
-    result_text = "\n".join(text_parts)
+    return "\n".join(text_parts)
 
+
+def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
+    """Rewrite article via Claude. Long articles are split into chunks so the
+    full volume survives the 64k output-token cap."""
+    if len(article.text) > SINGLE_SHOT_CHAR_LIMIT:
+        return _rewrite_chunked(article)
+
+    result_text = _call_claude(SYSTEM_PROMPT, _build_user_prompt(article))
     result = _parse_response(result_text)
-
-    # Apply inline styles for WordPress compatibility
     result.html_content = _apply_inline_styles(result.html_content)
+    return _finalize_article(result)
 
-    # Defense in depth: guarantee every H2 has an IMAGE_PLACEHOLDER immediately
-    # after it, even if Claude forgot. Missing placeholders get auto-inserted
-    # with generic prompts derived from the H2 text.
+
+def _finalize_article(result: RewrittenArticle) -> RewrittenArticle:
+    """Shared post-processing for both single-shot and chunked rewrites."""
+    # Guarantee every H2 has an IMAGE_PLACEHOLDER immediately after it.
     (
         result.html_content,
         result.image_prompts,
@@ -310,10 +342,7 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
     ) = _ensure_h2_have_placeholders(
         result.html_content, result.image_prompts, result.image_styles
     )
-
-    # Renumber every placeholder sequentially in document order and realign
-    # prompts/styles. Eliminates duplicate placeholder numbers (which made
-    # str.replace put the SAME image in two spots) and number gaps.
+    # Renumber placeholders sequentially in document order and realign prompts.
     (
         result.html_content,
         result.image_prompts,
@@ -321,14 +350,92 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
     ) = _normalize_placeholders(
         result.html_content, result.image_prompts, result.image_styles
     )
-
-    # Fill any now-empty prompt slots (duplicates collapsed above, or Claude
-    # truncated the metadata block) with a heading-aware generic prompt.
+    # Fill any empty prompt slots with a heading-aware generic prompt.
     result.image_prompts, result.image_styles = ensure_prompts_for_all_placeholders(
         result.html_content, result.image_prompts, result.image_styles
     )
-
     return result
+
+
+def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
+    """Split text into chunks of at most ~max_chars, breaking on blank lines
+    so a paragraph is never cut in half."""
+    paragraphs = re.split(r"\n\s*\n", text)
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for p in paragraphs:
+        p_len = len(p)
+        if cur and cur_len + p_len > max_chars:
+            chunks.append("\n\n".join(cur))
+            cur = [p]
+            cur_len = p_len
+        else:
+            cur.append(p)
+            cur_len += p_len
+    if cur:
+        chunks.append("\n\n".join(cur))
+    return chunks
+
+
+def _offset_placeholder_numbers(html: str, offset: int) -> str:
+    """Shift every IMAGE_PLACEHOLDER_N in html by +offset so chunk-local
+    numbering stays unique after concatenation."""
+    if offset == 0:
+        return html
+
+    def _repl(m: re.Match) -> str:
+        return f"<!-- IMAGE_PLACEHOLDER_{int(m.group(1)) + offset} -->"
+
+    return re.sub(
+        r"<!--\s*IMAGE_PLACEHOLDER_(\d+)\s*-->", _repl, html, flags=re.IGNORECASE
+    )
+
+
+def _rewrite_chunked(article: ScrapedArticle) -> RewrittenArticle:
+    """Rewrite a long article in multiple Claude calls and stitch the pieces
+    together. The lead chunk produces the title/slug/meta + hero; continuation
+    chunks produce only body HTML + image prompts."""
+    chunks = _split_text_into_chunks(article.text, REWRITE_CHUNK_CHAR_LIMIT)
+
+    title = slug = meta = ""
+    html_parts: list[str] = []
+    all_prompts: list[str] = []
+    all_styles: list[str] = []
+    offset = 0
+
+    for idx, chunk_text in enumerate(chunks):
+        is_lead = idx == 0
+        is_last = idx == len(chunks) - 1
+        system = SYSTEM_PROMPT if is_lead else CONTINUATION_SYSTEM_PROMPT
+        user = _build_chunk_user_prompt(
+            article, chunk_text, idx, len(chunks), is_lead, is_last
+        )
+        raw = _call_claude(system, user)
+        parsed = _parse_response(raw, force_first_hero=is_lead)
+
+        if is_lead:
+            title, slug, meta = parsed.title, parsed.slug, parsed.meta_description
+
+        html_parts.append(_offset_placeholder_numbers(parsed.html_content, offset))
+        all_prompts.extend(parsed.image_prompts)
+        all_styles.extend(parsed.image_styles)
+        offset += len(parsed.image_prompts)
+
+    combined = RewrittenArticle(
+        title=title,
+        html_content="\n".join(html_parts),
+        meta_description=meta,
+        image_prompts=all_prompts,
+        image_styles=all_styles,
+        slug=slug,
+    )
+    combined.html_content = _apply_inline_styles(combined.html_content)
+    print(
+        f"[rewriter] chunked rewrite: {len(chunks)} chunks, "
+        f"{len(all_prompts)} image prompts before finalize."
+    )
+    return _finalize_article(combined)
 
 
 def _normalize_placeholders(
@@ -574,6 +681,56 @@ def _build_user_prompt(article: ScrapedArticle) -> str:
 出力は必ず ---METADATA--- と ---HTML--- のセパレータで区切ってください。"""
 
 
+def _build_chunk_user_prompt(
+    article: ScrapedArticle,
+    chunk_text: str,
+    idx: int,
+    total: int,
+    is_lead: bool,
+    is_last: bool,
+) -> str:
+    position = (
+        "記事の冒頭パート" if is_lead
+        else ("記事の最終パート" if is_last else "記事の中間パート")
+    )
+    lead_note = (
+        "- このパートは記事の冒頭です。導入の挨拶 + アイキャッチ( <!-- IMAGE_PLACEHOLDER_1 --> )"
+        "から始めてください。\n"
+        "- ---METADATA--- に title / slug / meta_description も書いてください。"
+        if is_lead
+        else "- このパートは記事の途中です。挨拶やアイキャッチは書かず、本文(H2)から始めてください。\n"
+        "- ---METADATA--- には title / slug / meta_description は書かないでください(image_prompt_N と image_style_N のみ)。"
+    )
+    last_note = (
+        "- このパートは記事の最後です。自然なまとめ・結びで締めてください。"
+        if is_last
+        else "- このパートはまだ記事の途中なので、まとめ・結論は書かず、淡々と本文を続けてください。"
+    )
+
+    return f"""以下は長い記事を分割した {total} パート中の {idx + 1} パート目({position})です。
+このパートに含まれる元記事の内容を、漏れなく完全にリライトしてください。
+
+## 元記事のタイトル(参考)
+{article.title}
+
+## このパートの元記事本文
+{chunk_text}
+
+## リライトの指示
+- このパートに含まれる元記事の内容を、すべて漏れなくリライトしてください。情報を省略・要約しないでください。
+- 元記事と同等以上のボリュームを維持してください。
+- 購入誘導リンクは削除しつつ、そこで語られていたノウハウ自体は自分の言葉で詳しく解説し直してください。
+{lead_note}
+{last_note}
+
+【画像配置】
+- すべてのH2見出しの直後に <!-- IMAGE_PLACEHOLDER_N --> を配置(このパート内で N は 1 から振ってOK)
+- 長いH2には中盤にも追加画像
+- metadata に image_prompt_N と image_style_N(figure/accent/operation)を対応させて書く
+
+出力は必ず ---METADATA--- と ---HTML--- のセパレータで区切ってください。"""
+
+
 def _apply_inline_styles(html_content: str) -> str:
     """Apply inline styles to HTML elements for WordPress compatibility.
     WordPress strips <style> tags, so all styling must be inline."""
@@ -623,8 +780,13 @@ def _apply_inline_styles(html_content: str) -> str:
     return f'<div style="{wrapper_style}">\n{html_content}\n</div>'
 
 
-def _parse_response(text: str) -> RewrittenArticle:
-    """Parse the separated metadata + HTML response."""
+def _parse_response(text: str, force_first_hero: bool = True) -> RewrittenArticle:
+    """Parse the separated metadata + HTML response.
+
+    force_first_hero: when True (lead/single-shot), the first image is forced
+    to style "hero". For continuation chunks it is False so the first image
+    keeps its declared style instead of becoming a banner mid-article.
+    """
     # Split by separators
     metadata_match = re.search(r"---METADATA---\s*\n(.*?)\n---HTML---", text, re.DOTALL)
 
@@ -651,15 +813,15 @@ def _parse_response(text: str) -> RewrittenArticle:
     meta_description = extract_field(metadata_block, "meta_description")
     slug = extract_field(metadata_block, "slug")
 
-    # Extract ALL image prompts (dynamic count - not just 1-3)
+    # Extract ALL image prompts (dynamic count)
     image_prompts = []
     image_styles = []
-    for i in range(1, 30):  # Support up to 29 images
+    for i in range(1, 80):  # Support up to 79 images per call
         prompt = extract_field(metadata_block, f"image_prompt_{i}")
         if prompt:
             image_prompts.append(prompt)
             raw_style = extract_field(metadata_block, f"image_style_{i}").lower().strip()
-            if i == 1:
+            if i == 1 and force_first_hero:
                 image_styles.append("hero")
             elif raw_style == "operation":
                 image_styles.append("operation")
@@ -667,6 +829,8 @@ def _parse_response(text: str) -> RewrittenArticle:
                 image_styles.append("accent")
             elif raw_style == "figure":
                 image_styles.append("figure")
+            elif raw_style == "hero":
+                image_styles.append("hero")
             else:
                 # default: prefer the lighter style — keeps text-only sections
                 # from getting overloaded with dense explainer diagrams when
