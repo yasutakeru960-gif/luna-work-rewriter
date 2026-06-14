@@ -320,16 +320,35 @@ def _call_claude(system_prompt: str, user_prompt: str) -> str:
     return "\n".join(text_parts)
 
 
-def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
-    """Rewrite article via Claude. Long articles are split into chunks so the
-    full volume survives the 64k output-token cap."""
-    if len(article.text) > SINGLE_SHOT_CHAR_LIMIT:
-        return _rewrite_chunked(article)
+def estimate_chunks(article: ScrapedArticle) -> int:
+    """How many Claude calls rewrite_article will make for this article."""
+    if len(article.text) <= SINGLE_SHOT_CHAR_LIMIT:
+        return 1
+    return len(_split_text_into_chunks(article.text, REWRITE_CHUNK_CHAR_LIMIT))
 
+
+def rewrite_article(
+    article: ScrapedArticle,
+    progress_callback=None,
+) -> RewrittenArticle:
+    """Rewrite article via Claude. Long articles are split into chunks so the
+    full volume survives the 64k output-token cap.
+
+    progress_callback(done, total, message) is called before and after each
+    chunk so the UI can show a live progress bar.
+    """
+    if len(article.text) > SINGLE_SHOT_CHAR_LIMIT:
+        return _rewrite_chunked(article, progress_callback=progress_callback)
+
+    if progress_callback:
+        progress_callback(0, 1, "リライト中...")
     result_text = _call_claude(SYSTEM_PROMPT, _build_user_prompt(article))
     result = _parse_response(result_text)
     result.html_content = _apply_inline_styles(result.html_content)
-    return _finalize_article(result)
+    final = _finalize_article(result)
+    if progress_callback:
+        progress_callback(1, 1, "完了")
+    return final
 
 
 def _finalize_article(result: RewrittenArticle) -> RewrittenArticle:
@@ -358,21 +377,53 @@ def _finalize_article(result: RewrittenArticle) -> RewrittenArticle:
 
 
 def _split_text_into_chunks(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks of at most ~max_chars, breaking on blank lines
-    so a paragraph is never cut in half."""
-    paragraphs = re.split(r"\n\s*\n", text)
+    """Split text into chunks of at most ~max_chars, preferring blank-line
+    (paragraph) boundaries, then single newlines, then a hard cut so a chunk
+    can never exceed roughly max_chars even with no paragraph breaks."""
+    # First split on blank lines, but hard-split any single block that is
+    # itself larger than max_chars (on newlines, else by raw slicing).
+    raw_blocks = re.split(r"\n\s*\n", text)
+    blocks: list[str] = []
+    for b in raw_blocks:
+        if len(b) <= max_chars:
+            blocks.append(b)
+            continue
+        # Block too big — split on single newlines
+        line_buf: list[str] = []
+        line_len = 0
+        for line in b.split("\n"):
+            if line_buf and line_len + len(line) > max_chars:
+                blocks.append("\n".join(line_buf))
+                line_buf = [line]
+                line_len = len(line)
+            else:
+                line_buf.append(line)
+                line_len += len(line)
+        if line_buf:
+            blocks.append("\n".join(line_buf))
+
+    # Final guard: any block still over max_chars gets raw-sliced.
+    sliced: list[str] = []
+    for b in blocks:
+        if len(b) <= max_chars:
+            sliced.append(b)
+        else:
+            for i in range(0, len(b), max_chars):
+                sliced.append(b[i : i + max_chars])
+
+    # Pack blocks into chunks up to max_chars.
     chunks: list[str] = []
     cur: list[str] = []
     cur_len = 0
-    for p in paragraphs:
-        p_len = len(p)
-        if cur and cur_len + p_len > max_chars:
+    for b in sliced:
+        b_len = len(b)
+        if cur and cur_len + b_len > max_chars:
             chunks.append("\n\n".join(cur))
-            cur = [p]
-            cur_len = p_len
+            cur = [b]
+            cur_len = b_len
         else:
-            cur.append(p)
-            cur_len += p_len
+            cur.append(b)
+            cur_len += b_len
     if cur:
         chunks.append("\n\n".join(cur))
     return chunks
@@ -392,11 +443,14 @@ def _offset_placeholder_numbers(html: str, offset: int) -> str:
     )
 
 
-def _rewrite_chunked(article: ScrapedArticle) -> RewrittenArticle:
+def _rewrite_chunked(
+    article: ScrapedArticle, progress_callback=None
+) -> RewrittenArticle:
     """Rewrite a long article in multiple Claude calls and stitch the pieces
     together. The lead chunk produces the title/slug/meta + hero; continuation
     chunks produce only body HTML + image prompts."""
     chunks = _split_text_into_chunks(article.text, REWRITE_CHUNK_CHAR_LIMIT)
+    total = len(chunks)
 
     title = slug = meta = ""
     html_parts: list[str] = []
@@ -407,6 +461,8 @@ def _rewrite_chunked(article: ScrapedArticle) -> RewrittenArticle:
     for idx, chunk_text in enumerate(chunks):
         is_lead = idx == 0
         is_last = idx == len(chunks) - 1
+        if progress_callback:
+            progress_callback(idx, total, f"パート {idx + 1}/{total} をリライト中...")
         system = SYSTEM_PROMPT if is_lead else CONTINUATION_SYSTEM_PROMPT
         user = _build_chunk_user_prompt(
             article, chunk_text, idx, len(chunks), is_lead, is_last
@@ -421,6 +477,10 @@ def _rewrite_chunked(article: ScrapedArticle) -> RewrittenArticle:
         all_prompts.extend(parsed.image_prompts)
         all_styles.extend(parsed.image_styles)
         offset += len(parsed.image_prompts)
+        if progress_callback:
+            progress_callback(
+                idx + 1, total, f"パート {idx + 1}/{total} 完了 (画像 {len(all_prompts)}枚分)"
+            )
 
     combined = RewrittenArticle(
         title=title,
