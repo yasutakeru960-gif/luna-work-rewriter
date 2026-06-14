@@ -356,10 +356,18 @@ def insert_images_into_html(
     html_content: str,
     media_items: list[WPMediaItem],
 ) -> str:
-    """Replace IMAGE_PLACEHOLDER_N comments with actual WordPress image tags."""
-    for i, media in enumerate(media_items):
-        placeholder = f"<!-- IMAGE_PLACEHOLDER_{i + 1} -->"
-        img_tag = (
+    """Replace IMAGE_PLACEHOLDER_N comments with actual WordPress image tags.
+
+    Each placeholder number maps to media_items[N-1] and is replaced only
+    ONCE (the first occurrence), so a duplicate placeholder number in the
+    HTML can never reuse the same image in two spots. Any placeholder left
+    unreplaced (no matching media, or a duplicate second occurrence) is
+    stripped so no raw HTML comment ships to the published article.
+    """
+    import re as _re
+
+    def _img_tag(media: WPMediaItem) -> str:
+        return (
             f'<figure class="wp-block-image size-large" '
             f'style="text-align:center; margin: 2em auto;">'
             f'<img src="{media.source_url}" alt="" '
@@ -367,5 +375,15 @@ def insert_images_into_html(
             f'style="max-width:100%; height:auto; border-radius:8px;"/>'
             f"</figure>"
         )
-        html_content = html_content.replace(placeholder, img_tag)
+
+    for i, media in enumerate(media_items):
+        placeholder = f"<!-- IMAGE_PLACEHOLDER_{i + 1} -->"
+        # count=1 → replace only the first occurrence
+        html_content = html_content.replace(placeholder, _img_tag(media), 1)
+
+    # Strip any placeholders that were never replaced (missing media or
+    # duplicate numbers) so the published HTML has no leftover comments.
+    html_content = _re.sub(
+        r"<!--\s*IMAGE_PLACEHOLDER_\d+\s*-->", "", html_content
+    )
     return html_content

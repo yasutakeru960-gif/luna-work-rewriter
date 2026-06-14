@@ -21,10 +21,16 @@ def _get_client():
 SYSTEM_PROMPT = """あなたは「LUNA WORK」というWebメディアの専属ライターです。
 以下のガイドラインに厳密に従って、元記事を **同等以上のボリュームと情報量** でリライトしてください。
 
-## 🔴 最優先ルール: 画像配置(これを守らないと記事として失敗です)
+## 🔴 最優先ルール1: ボリュームを削らない
+
+- **元記事の見出し構造・セクション数を維持してください。元記事に10章あれば、リライトも概ね同等の章数にすること。**
+- 勝手に「3章にまとめる」「内容を圧縮する」のは禁止です。読者は詳しい解説を求めています。
+- 各セクションは十分なボリューム(目安300〜600文字)を確保してください。
+
+## 🔴 最優先ルール2: 画像配置(これを守らないと記事として失敗です)
 
 - **アイキャッチ1枚** + **すべてのH2見出しの直後に1枚** + **長いH2セクションには中盤にも1〜2枚**
-- H2が10個ある記事なら、最低 1+10=11枚、推奨 13〜17枚 の image_prompt を作成し、対応するplaceholderをHTML本文に配置すること
+- H2が10個ある記事なら、最低 1+10=11枚、推奨 14〜18枚 の image_prompt を作成し、対応するplaceholderをHTML本文に配置すること
 - **1つのH2でも画像が無いまま終わったら、その記事は不合格** です
 - 詳細は後述の「画像プレースホルダーの配置ルール」と「image_promptsについて」のセクションを必ず参照してください
 
@@ -305,15 +311,79 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
         result.html_content, result.image_prompts, result.image_styles
     )
 
-    # Also fill in any orphan PLACEHOLDER (placeholder exists in HTML but its
-    # number is beyond the image_prompts list). Common cause: Claude truncated
-    # the metadata block after ~N prompts but kept emitting <!-- IMAGE_PLACEHOLDER_K -->
-    # markers in the body, so K>N orphans stay empty in the published article.
+    # Renumber every placeholder sequentially in document order and realign
+    # prompts/styles. Eliminates duplicate placeholder numbers (which made
+    # str.replace put the SAME image in two spots) and number gaps.
+    (
+        result.html_content,
+        result.image_prompts,
+        result.image_styles,
+    ) = _normalize_placeholders(
+        result.html_content, result.image_prompts, result.image_styles
+    )
+
+    # Fill any now-empty prompt slots (duplicates collapsed above, or Claude
+    # truncated the metadata block) with a heading-aware generic prompt.
     result.image_prompts, result.image_styles = ensure_prompts_for_all_placeholders(
         result.html_content, result.image_prompts, result.image_styles
     )
 
     return result
+
+
+def _normalize_placeholders(
+    html: str,
+    image_prompts: list[str],
+    image_styles: list[str] | None,
+) -> tuple[str, list[str], list[str]]:
+    """Renumber IMAGE_PLACEHOLDER markers 1..K in document order and realign
+    image_prompts / image_styles to match.
+
+    Why: Claude sometimes emits the same placeholder number twice (e.g.
+    IMAGE_PLACEHOLDER_12 after two different H2s) or skips numbers. Because
+    insert_images_into_html replaces ALL occurrences of a number, a duplicate
+    number makes the SAME image appear in two places. Renumbering by document
+    order guarantees each on-page image slot is unique and maps to exactly one
+    prompt.
+
+    A placeholder whose source prompt is missing or already consumed (the
+    duplicate case) gets an empty prompt slot here; ensure_prompts_for_all_
+    placeholders fills it with a heading-aware generic prompt afterwards.
+    """
+    placeholder_re = re.compile(
+        r"<!--\s*IMAGE_PLACEHOLDER_(\d+)\s*-->", re.IGNORECASE
+    )
+    styles = list(image_styles) if image_styles else []
+    while len(styles) < len(image_prompts):
+        styles.append("hero" if len(styles) == 0 else "figure")
+
+    new_prompts: list[str] = []
+    new_styles: list[str] = []
+    counter = {"n": 0}
+    consumed: set[int] = set()
+
+    def _repl(m: re.Match) -> str:
+        counter["n"] += 1
+        new_num = counter["n"]
+        src = int(m.group(1)) - 1
+        if (
+            0 <= src < len(image_prompts)
+            and image_prompts[src]
+            and src not in consumed
+        ):
+            new_prompts.append(image_prompts[src])
+            new_styles.append(
+                styles[src] if src < len(styles) else ("hero" if new_num == 1 else "figure")
+            )
+            consumed.add(src)
+        else:
+            # duplicate / missing source -> leave empty for heading-aware fill
+            new_prompts.append("")
+            new_styles.append("hero" if new_num == 1 else "accent")
+        return f"<!-- IMAGE_PLACEHOLDER_{new_num} -->"
+
+    new_html = placeholder_re.sub(_repl, html)
+    return new_html, new_prompts, new_styles
 
 
 def ensure_prompts_for_all_placeholders(
