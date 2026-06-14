@@ -8,7 +8,11 @@ from PIL import Image
 
 import config
 from scraper import scrape_article, create_article_from_text, ScrapedArticle
-from rewriter import rewrite_article, RewrittenArticle
+from rewriter import (
+    rewrite_article,
+    RewrittenArticle,
+    ensure_prompts_for_all_placeholders,
+)
 from image_gen import (
     GeneratedImage,
     generate_article_images_parallel,
@@ -311,22 +315,48 @@ with input_tab_draft:
         try:
             data = json.loads(uploaded_draft.read().decode("utf-8"))
             st.session_state.scraped = ScrapedArticle(**data["scraped"])
-            st.session_state.rewritten = RewrittenArticle(**data["rewritten"])
+            rewritten = RewrittenArticle(**data["rewritten"])
+
+            # Backfill prompts/styles for any orphan placeholders left in the
+            # HTML by older drafts that ran with the buggy post-processor.
+            before_count = len(rewritten.image_prompts)
+            (
+                rewritten.image_prompts,
+                rewritten.image_styles,
+            ) = ensure_prompts_for_all_placeholders(
+                rewritten.html_content,
+                rewritten.image_prompts,
+                rewritten.image_styles,
+            )
+            backfilled = len(rewritten.image_prompts) - before_count
+            st.session_state.rewritten = rewritten
 
             images_data = data.get("images") or []
             media_data = data.get("media_items") or []
             restored_images = [_deserialize_image(d) for d in images_data]
             restored_media = [_deserialize_media(d) for d in media_data]
-            st.session_state.images = restored_images if restored_images else None
-            st.session_state.media_items = restored_media if restored_media else None
+            # If we just added new prompt slots, pad the images/media lists
+            # with None so the per-image grid lines up.
+            while len(restored_images) < len(rewritten.image_prompts):
+                restored_images.append(None)
+            while len(restored_media) < len(rewritten.image_prompts):
+                restored_media.append(None)
+            st.session_state.images = restored_images
+            st.session_state.media_items = restored_media
             st.session_state.wp_post = None
 
             done_imgs = sum(1 for i in restored_images if i is not None)
             done_media = sum(1 for m in restored_media if m is not None)
-            st.success(
+            msg = (
                 f"下書きを復元しました(画像 {done_imgs}枚 / アップロード済 {done_media}枚)。"
                 " Step 4以降から再開できます"
             )
+            if backfilled:
+                msg += (
+                    f" / orphan placeholder {backfilled} 件を検出し、自動でプロンプトを補完しました"
+                    "(Step 4で「残り◯枚を生成」を押すと埋まります)"
+                )
+            st.success(msg)
             st.rerun()
         except Exception as e:
             st.error(f"下書きの読み込み失敗: {e}")

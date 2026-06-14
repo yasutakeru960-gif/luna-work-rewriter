@@ -288,7 +288,94 @@ def rewrite_article(article: ScrapedArticle) -> RewrittenArticle:
         result.html_content, result.image_prompts, result.image_styles
     )
 
+    # Also fill in any orphan PLACEHOLDER (placeholder exists in HTML but its
+    # number is beyond the image_prompts list). Common cause: Claude truncated
+    # the metadata block after ~N prompts but kept emitting <!-- IMAGE_PLACEHOLDER_K -->
+    # markers in the body, so K>N orphans stay empty in the published article.
+    result.image_prompts, result.image_styles = ensure_prompts_for_all_placeholders(
+        result.html_content, result.image_prompts, result.image_styles
+    )
+
     return result
+
+
+def ensure_prompts_for_all_placeholders(
+    html: str,
+    image_prompts: list[str],
+    image_styles: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """For every IMAGE_PLACEHOLDER_N comment in the HTML, make sure
+    image_prompts has a non-empty entry at index N-1 (and image_styles
+    has a matching entry).
+
+    Missing entries are backfilled with a generic prompt derived from the
+    nearest preceding H2/H3 heading so the orphan placeholder still ends up
+    with a relevant image instead of being silently dropped.
+    """
+    placeholder_re = re.compile(
+        r"<!--\s*IMAGE_PLACEHOLDER_(\d+)\s*-->", re.IGNORECASE
+    )
+    heading_re = re.compile(r"<(h[23])[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+
+    placeholder_nums = sorted(
+        {int(m.group(1)) for m in placeholder_re.finditer(html)}
+    )
+    if not placeholder_nums:
+        return image_prompts, list(image_styles) if image_styles else []
+
+    max_num = max(placeholder_nums)
+
+    # Walk the document and remember the most-recent heading before each
+    # placeholder so the generic prompt can name the section.
+    events: list[tuple[int, str, object]] = []
+    for m in heading_re.finditer(html):
+        text = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        events.append((m.start(), "heading", text))
+    for m in placeholder_re.finditer(html):
+        events.append((m.start(), "placeholder", int(m.group(1))))
+    events.sort(key=lambda e: e[0])
+
+    last_heading = "article opener"
+    heading_for_ph: dict[int, str] = {}
+    for _, kind, value in events:
+        if kind == "heading":
+            assert isinstance(value, str)
+            if value:
+                last_heading = value
+        else:
+            assert isinstance(value, int)
+            heading_for_ph.setdefault(value, last_heading)
+
+    new_prompts = list(image_prompts)
+    new_styles = list(image_styles) if image_styles else []
+    while len(new_styles) < len(new_prompts):
+        new_styles.append("hero" if len(new_styles) == 0 else "figure")
+
+    inserted = 0
+    for n in range(1, max_num + 1):
+        idx = n - 1
+        if idx < len(new_prompts) and new_prompts[idx]:
+            continue
+        while len(new_prompts) <= idx:
+            new_prompts.append("")
+            new_styles.append("figure" if len(new_styles) > 0 else "hero")
+        heading = heading_for_ph.get(n, "article section")
+        new_prompts[idx] = (
+            f"Friendly explainer illustration for the article section titled: "
+            f'"{heading}". Visualize the main concept of this section with '
+            f"the recurring chibi character demonstrating the idea, plus relevant "
+            f"icons or UI elements that match the topic."
+        )
+        new_styles[idx] = new_styles[idx] or "figure"
+        inserted += 1
+
+    if inserted:
+        print(
+            f"[rewriter] Auto-filled {inserted} missing image_prompts "
+            f"for orphan placeholders."
+        )
+
+    return new_prompts, new_styles
 
 
 def _ensure_h2_have_placeholders(
