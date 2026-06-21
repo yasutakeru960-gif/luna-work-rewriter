@@ -302,9 +302,12 @@ SINGLE_SHOT_CHAR_LIMIT = 38000
 REWRITE_CHUNK_CHAR_LIMIT = 28000
 
 
-def _call_claude(system_prompt: str, user_prompt: str) -> str:
-    """One streaming Claude call with extended thinking. Returns text output."""
-    text_parts = []
+def _call_claude(system_prompt: str, user_prompt: str, on_delta=None) -> str:
+    """One streaming Claude call with extended thinking. Returns text output.
+
+    on_delta(chars_generated) is called as text streams in, so the UI can show
+    a live "○○文字生成中" counter instead of a frozen spinner.
+    """
     with _get_client().messages.stream(
         model=config.CLAUDE_MODEL,
         max_tokens=config.CLAUDE_MAX_TOKENS,
@@ -315,7 +318,27 @@ def _call_claude(system_prompt: str, user_prompt: str) -> str:
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
+        if on_delta:
+            acc = 0
+            last_report = 0
+            for event in stream:
+                delta_text = None
+                et = getattr(event, "type", None)
+                if et == "text":
+                    delta_text = getattr(event, "text", None)
+                elif et == "content_block_delta":
+                    d = getattr(event, "delta", None)
+                    if d is not None and getattr(d, "type", None) == "text_delta":
+                        delta_text = getattr(d, "text", None)
+                if delta_text:
+                    acc += len(delta_text)
+                    # throttle UI updates to every ~200 chars
+                    if acc - last_report >= 200:
+                        last_report = acc
+                        on_delta(acc)
+            on_delta(acc)
         response = stream.get_final_message()
+    text_parts = []
     for block in response.content:
         if block.type == "text":
             text_parts.append(block.text)
@@ -334,22 +357,34 @@ def rewrite_article(
     progress_callback=None,
 ) -> RewrittenArticle:
     """Rewrite article via Claude. Long articles are split into chunks so the
-    full volume survives the 64k output-token cap.
+    full volume survives the output-token cap.
 
-    progress_callback(done, total, message) is called before and after each
-    chunk so the UI can show a live progress bar.
+    progress_callback(fraction, message) is called continuously (including as
+    text streams in) so the UI can show a live, moving progress bar.
     """
     if len(article.text) > SINGLE_SHOT_CHAR_LIMIT:
         return _rewrite_chunked(article, progress_callback=progress_callback)
 
+    # Expected output volume ≈ source length (rewrite keeps similar size).
+    expected = max(len(article.text), 4000)
+
+    def _on_delta(n: int):
+        if progress_callback:
+            frac = min(n / expected, 0.97)
+            progress_callback(frac, f"リライト中... {n:,}文字 生成済み")
+
     if progress_callback:
-        progress_callback(0, 1, "リライト中...")
-    result_text = _call_claude(SYSTEM_PROMPT, _build_user_prompt(article))
+        progress_callback(0.0, "Claudeが考え中...(数十秒)")
+    result_text = _call_claude(
+        SYSTEM_PROMPT, _build_user_prompt(article), on_delta=_on_delta
+    )
+    if progress_callback:
+        progress_callback(0.98, "整形中...")
     result = _parse_response(result_text)
     result.html_content = _apply_inline_styles(result.html_content)
     final = _finalize_article(result)
     if progress_callback:
-        progress_callback(1, 1, "完了")
+        progress_callback(1.0, "完了")
     return final
 
 
@@ -463,13 +498,25 @@ def _rewrite_chunked(
     for idx, chunk_text in enumerate(chunks):
         is_lead = idx == 0
         is_last = idx == len(chunks) - 1
+        base = idx / total
+        span = 1.0 / total
+        expected = max(len(chunk_text), 4000)
+
+        def _on_delta(n: int, _base=base, _span=span, _exp=expected, _idx=idx):
+            if progress_callback:
+                frac = _base + _span * min(n / _exp, 0.97)
+                progress_callback(
+                    min(frac, 0.97),
+                    f"パート {_idx + 1}/{total} 生成中... {n:,}文字",
+                )
+
         if progress_callback:
-            progress_callback(idx, total, f"パート {idx + 1}/{total} をリライト中...")
+            progress_callback(base, f"パート {idx + 1}/{total} Claudeが考え中...")
         system = SYSTEM_PROMPT if is_lead else CONTINUATION_SYSTEM_PROMPT
         user = _build_chunk_user_prompt(
             article, chunk_text, idx, len(chunks), is_lead, is_last
         )
-        raw = _call_claude(system, user)
+        raw = _call_claude(system, user, on_delta=_on_delta)
         parsed = _parse_response(raw, force_first_hero=is_lead)
 
         if is_lead:
@@ -481,8 +528,12 @@ def _rewrite_chunked(
         offset += len(parsed.image_prompts)
         if progress_callback:
             progress_callback(
-                idx + 1, total, f"パート {idx + 1}/{total} 完了 (画像 {len(all_prompts)}枚分)"
+                (idx + 1) / total,
+                f"パート {idx + 1}/{total} 完了 (画像 {len(all_prompts)}枚分)",
             )
+
+    if progress_callback:
+        progress_callback(0.99, "整形中...")
 
     combined = RewrittenArticle(
         title=title,

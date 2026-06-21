@@ -396,16 +396,17 @@ if st.session_state.scraped:
     if _est_chunks > 1:
         st.caption(
             f"元記事 約{_char_count:,}字 → 長いため{_est_chunks}分割でリライトします"
-            f"（ボリュームを保つため。1パートあたり30〜60秒、合計で"
-            f"{_est_chunks}〜{_est_chunks * 2}分ほどかかります）"
+            f"（ボリュームを保つため。合計で数分かかります）"
         )
+    else:
+        st.caption(f"元記事 約{_char_count:,}字 → 1回でリライトします（30秒〜数分）")
     if st.button("リライト実行", type="primary"):
         rewrite_progress = st.progress(0.0, text="リライト準備中...")
 
-        def _rewrite_progress(done, total, message):
-            # leave a little headroom for the finalize step
-            frac = (done / total) * 0.95 if total else 0.0
-            rewrite_progress.progress(min(frac, 1.0), text=message)
+        def _rewrite_progress(fraction, message):
+            rewrite_progress.progress(
+                min(max(fraction, 0.0), 1.0), text=message
+            )
 
         try:
             st.session_state.rewritten = rewrite_article(
