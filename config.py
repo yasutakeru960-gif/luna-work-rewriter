@@ -25,7 +25,9 @@ ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 
 # === Claude model ===
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+# claude-sonnet-4-20250514 was retired (404 not_found_error). Current Sonnet
+# is claude-sonnet-4-6; its dateless ID maps to a fixed snapshot.
+CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_MAX_TOKENS = 64000  # Total budget (thinking + output)
 CLAUDE_THINKING_BUDGET = 8000  # Tokens reserved for thinking
 
