@@ -27,9 +27,11 @@ OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
 # === Claude model ===
 # claude-sonnet-4-20250514 was retired (404 not_found_error). Current Sonnet
 # is claude-sonnet-4-6; its dateless ID maps to a fixed snapshot.
+# Sonnet 4.6 supports up to 128k output tokens (vs 64k on Sonnet 4), so we run
+# a larger budget and split long articles into fewer, bigger chunks.
 CLAUDE_MODEL = "claude-sonnet-4-6"
-CLAUDE_MAX_TOKENS = 64000  # Total budget (thinking + output)
-CLAUDE_THINKING_BUDGET = 8000  # Tokens reserved for thinking
+CLAUDE_MAX_TOKENS = 120000  # Total budget (thinking + output); 4.6 cap is 128k
+CLAUDE_THINKING_BUDGET = 10000  # Tokens reserved for thinking
 
 # === OpenAI image model (gpt-image-2, released 2026-04-21) ===
 OPENAI_IMAGE_MODEL = "gpt-image-2"

@@ -293,11 +293,13 @@ class RewrittenArticle:
 
 
 # Articles longer than this (source chars) are rewritten in multiple chunks,
-# because a single Claude call caps at 64k output tokens — not enough to
-# rewrite a ~45k-char article at equal volume in one shot.
-SINGLE_SHOT_CHAR_LIMIT = 22000
+# Sonnet 4.6 allows up to 128k output tokens, so a single call can rewrite a
+# much larger article before it has to summarize to fit. Articles under
+# SINGLE_SHOT_CHAR_LIMIT are done in one call; longer ones split into chunks of
+# ~REWRITE_CHUNK_CHAR_LIMIT each (45k chars -> 2 chunks instead of 4).
+SINGLE_SHOT_CHAR_LIMIT = 38000
 # Target source chars per chunk when splitting a long article.
-REWRITE_CHUNK_CHAR_LIMIT = 13000
+REWRITE_CHUNK_CHAR_LIMIT = 28000
 
 
 def _call_claude(system_prompt: str, user_prompt: str) -> str:
