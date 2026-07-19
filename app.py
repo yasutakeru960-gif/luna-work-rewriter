@@ -13,6 +13,8 @@ from rewriter import (
     RewrittenArticle,
     ensure_prompts_for_all_placeholders,
     estimate_chunks,
+    saved_progress,
+    discard_saved_progress,
 )
 from image_gen import (
     GeneratedImage,
@@ -400,7 +402,27 @@ if st.session_state.scraped:
         )
     else:
         st.caption(f"元記事 約{_char_count:,}字 → 1回でリライトします（30秒〜数分）")
-    if st.button("リライト実行", type="primary"):
+
+    # Partial rewrite left over from a run that was interrupted (reconnect,
+    # rerun, reboot). Offer to continue from there instead of redoing part 1.
+    _saved = saved_progress(article)
+    if _saved and _saved["done"] < _saved["total"]:
+        _remaining = _saved["total"] - _saved["done"]
+        st.info(
+            f"前回のリライトが パート {_saved['done']}/{_saved['total']} まで保存されています。"
+            f"「リライト実行」を押すと残り{_remaining}パートだけを続きから生成します"
+            "（保存済みパートは再生成しません）。"
+        )
+        if st.button("保存分を破棄して最初からやり直す", key="btn_discard_ckpt"):
+            discard_saved_progress(article)
+            st.rerun()
+
+    _btn_label = (
+        f"続きからリライト実行（残り{_saved['total'] - _saved['done']}パート）"
+        if _saved and _saved["done"] < _saved["total"]
+        else "リライト実行"
+    )
+    if st.button(_btn_label, type="primary"):
         rewrite_progress = st.progress(0.0, text="リライト準備中...")
 
         def _rewrite_progress(fraction, message):
@@ -418,7 +440,15 @@ if st.session_state.scraped:
             st.success("リライト完了")
         except Exception as e:
             rewrite_progress.empty()
-            st.error(f"リライト失敗: {e}")
+            _partial = saved_progress(article)
+            if _partial and _partial["done"]:
+                st.error(
+                    f"リライト失敗: {e}\n\n"
+                    f"パート {_partial['done']}/{_partial['total']} までは保存済みです。"
+                    "もう一度「リライト実行」を押せば続きから再開します。"
+                )
+            else:
+                st.error(f"リライト失敗: {e}")
 
 # ========================================
 # Step 4: Preview & Image Generation

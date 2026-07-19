@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 from anthropic import Anthropic
 
+import checkpoint
 import config
 from scraper import ScrapedArticle
 
@@ -352,18 +354,47 @@ def estimate_chunks(article: ScrapedArticle) -> int:
     return len(_split_text_into_chunks(article.text, REWRITE_CHUNK_CHAR_LIMIT))
 
 
+def checkpoint_job_id(article: ScrapedArticle) -> str:
+    """Checkpoint key for this article under the current chunking + model."""
+    return checkpoint.make_job_id(
+        article.text, REWRITE_CHUNK_CHAR_LIMIT, config.CLAUDE_MODEL
+    )
+
+
+def saved_progress(article: ScrapedArticle) -> dict | None:
+    """Partial rewrite already on disk for this article, if any.
+
+    Returns {"done", "total", "title", "updated_at"} — used by the UI to offer
+    "resume from part N" instead of silently restarting from part 1.
+    """
+    if len(article.text) <= SINGLE_SHOT_CHAR_LIMIT:
+        return None
+    return checkpoint.peek(checkpoint_job_id(article))
+
+
+def discard_saved_progress(article: ScrapedArticle) -> None:
+    """Throw away the saved partial so the next run starts from part 1."""
+    checkpoint.clear(checkpoint_job_id(article))
+
+
 def rewrite_article(
     article: ScrapedArticle,
     progress_callback=None,
+    resume: bool = True,
 ) -> RewrittenArticle:
     """Rewrite article via Claude. Long articles are split into chunks so the
     full volume survives the output-token cap.
 
     progress_callback(fraction, message) is called continuously (including as
     text streams in) so the UI can show a live, moving progress bar.
+
+    resume=True replays chunks already saved on disk from an interrupted run
+    instead of paying for them again; resume=False forces a clean rewrite.
     """
     if len(article.text) > SINGLE_SHOT_CHAR_LIMIT:
-        return _rewrite_chunked(article, progress_callback=progress_callback)
+        return _rewrite_chunked(
+            article, progress_callback=progress_callback, resume=resume
+        )
 
     # Expected output volume ≈ source length (rewrite keeps similar size).
     expected = max(len(article.text), 4000)
@@ -480,14 +511,78 @@ def _offset_placeholder_numbers(html: str, offset: int) -> str:
     )
 
 
+# A chunk that dies on a transient API error would otherwise throw away the
+# whole run, so each one gets a couple of retries before giving up.
+CHUNK_ATTEMPTS = 3
+CHUNK_RETRY_BASE_SECONDS = 5
+
+
+def _rewrite_one_chunk(
+    article: ScrapedArticle,
+    chunk_text: str,
+    idx: int,
+    total: int,
+    is_lead: bool,
+    is_last: bool,
+    on_delta,
+    progress_callback,
+) -> RewrittenArticle:
+    """One chunk's Claude call, retried on transient failures."""
+    system = SYSTEM_PROMPT if is_lead else CONTINUATION_SYSTEM_PROMPT
+    user = _build_chunk_user_prompt(article, chunk_text, idx, total, is_lead, is_last)
+    last_err: Exception | None = None
+    for attempt in range(1, CHUNK_ATTEMPTS + 1):
+        try:
+            raw = _call_claude(system, user, on_delta=on_delta)
+            return _parse_response(raw, force_first_hero=is_lead)
+        except Exception as e:  # noqa: BLE001 — retry anything the API throws
+            last_err = e
+            if attempt == CHUNK_ATTEMPTS:
+                break
+            wait = CHUNK_RETRY_BASE_SECONDS * attempt
+            print(
+                f"[rewriter] chunk {idx + 1}/{total} failed "
+                f"(attempt {attempt}/{CHUNK_ATTEMPTS}): {e} — retrying in {wait}s"
+            )
+            if progress_callback:
+                progress_callback(
+                    idx / total,
+                    f"パート {idx + 1}/{total} 失敗 — {wait}秒後に再試行"
+                    f" ({attempt}/{CHUNK_ATTEMPTS})",
+                )
+            time.sleep(wait)
+    raise RuntimeError(
+        f"パート {idx + 1}/{total} が {CHUNK_ATTEMPTS} 回失敗しました: {last_err}"
+    ) from last_err
+
+
 def _rewrite_chunked(
-    article: ScrapedArticle, progress_callback=None
+    article: ScrapedArticle, progress_callback=None, resume: bool = True
 ) -> RewrittenArticle:
     """Rewrite a long article in multiple Claude calls and stitch the pieces
     together. The lead chunk produces the title/slug/meta + hero; continuation
-    chunks produce only body HTML + image prompts."""
+    chunks produce only body HTML + image prompts.
+
+    Every finished chunk is written to disk before the next one starts, so an
+    interrupted run resumes from the first unfinished part instead of redoing
+    work that was already paid for."""
     chunks = _split_text_into_chunks(article.text, REWRITE_CHUNK_CHAR_LIMIT)
     total = len(chunks)
+
+    ckpt = checkpoint.open_job(
+        job_id=checkpoint_job_id(article),
+        total_chunks=total,
+        source_title=article.title,
+        source_chars=len(article.text),
+        resume=resume,
+    )
+    if not resume:
+        ckpt.clear()
+    if ckpt.done_count:
+        print(
+            f"[rewriter] resuming chunked rewrite: "
+            f"{ckpt.done_count}/{total} chunks already saved."
+        )
 
     title = slug = meta = ""
     html_parts: list[str] = []
@@ -510,27 +605,66 @@ def _rewrite_chunked(
                     f"パート {_idx + 1}/{total} 生成中... {n:,}文字",
                 )
 
-        if progress_callback:
-            progress_callback(base, f"パート {idx + 1}/{total} Claudeが考え中...")
-        system = SYSTEM_PROMPT if is_lead else CONTINUATION_SYSTEM_PROMPT
-        user = _build_chunk_user_prompt(
-            article, chunk_text, idx, len(chunks), is_lead, is_last
-        )
-        raw = _call_claude(system, user, on_delta=_on_delta)
-        parsed = _parse_response(raw, force_first_hero=is_lead)
+        saved = ckpt.get(idx)
+        if saved:
+            # Replayed from disk — no API call, no cost, no wait.
+            chunk_title = saved.get("title", "")
+            chunk_slug = saved.get("slug", "")
+            chunk_meta = saved.get("meta", "")
+            chunk_html = saved.get("html", "")
+            chunk_prompts = list(saved.get("prompts") or [])
+            chunk_styles = list(saved.get("styles") or [])
+            if progress_callback:
+                progress_callback(
+                    (idx + 1) / total,
+                    f"パート {idx + 1}/{total} は保存済み — 再利用しました",
+                )
+        else:
+            if progress_callback:
+                progress_callback(base, f"パート {idx + 1}/{total} Claudeが考え中...")
+            parsed = _rewrite_one_chunk(
+                article,
+                chunk_text,
+                idx,
+                total,
+                is_lead,
+                is_last,
+                _on_delta,
+                progress_callback,
+            )
+            chunk_title = parsed.title
+            chunk_slug = parsed.slug
+            chunk_meta = parsed.meta_description
+            chunk_html = parsed.html_content
+            chunk_prompts = parsed.image_prompts
+            chunk_styles = parsed.image_styles
+            # Save the raw (un-offset) chunk before touching the next one, so a
+            # crash on part N never costs the parts before it.
+            ckpt.put(
+                idx,
+                {
+                    "title": chunk_title,
+                    "slug": chunk_slug,
+                    "meta": chunk_meta,
+                    "html": chunk_html,
+                    "prompts": chunk_prompts,
+                    "styles": chunk_styles,
+                },
+            )
+            if progress_callback:
+                progress_callback(
+                    (idx + 1) / total,
+                    f"パート {idx + 1}/{total} 完了・保存済み"
+                    f" (画像 {len(all_prompts) + len(chunk_prompts)}枚分)",
+                )
 
         if is_lead:
-            title, slug, meta = parsed.title, parsed.slug, parsed.meta_description
+            title, slug, meta = chunk_title, chunk_slug, chunk_meta
 
-        html_parts.append(_offset_placeholder_numbers(parsed.html_content, offset))
-        all_prompts.extend(parsed.image_prompts)
-        all_styles.extend(parsed.image_styles)
-        offset += len(parsed.image_prompts)
-        if progress_callback:
-            progress_callback(
-                (idx + 1) / total,
-                f"パート {idx + 1}/{total} 完了 (画像 {len(all_prompts)}枚分)",
-            )
+        html_parts.append(_offset_placeholder_numbers(chunk_html, offset))
+        all_prompts.extend(chunk_prompts)
+        all_styles.extend(chunk_styles)
+        offset += len(chunk_prompts)
 
     if progress_callback:
         progress_callback(0.99, "整形中...")
@@ -548,7 +682,11 @@ def _rewrite_chunked(
         f"[rewriter] chunked rewrite: {len(chunks)} chunks, "
         f"{len(all_prompts)} image prompts before finalize."
     )
-    return _finalize_article(combined)
+    final = _finalize_article(combined)
+    # Whole article assembled — the partial is no longer needed. Dropping it
+    # also stops the UI from offering to "resume" a rewrite that is done.
+    ckpt.clear()
+    return final
 
 
 def _normalize_placeholders(
